@@ -48,11 +48,11 @@ cp server/.env.example server/.env
 ### 2. Install Dependencies
 
 ```bash
-# Install all Node.js dependencies
-npm run install:all
-
-# Install Python dependencies
-npm run install:python
+# This automatically sets up everything:
+# - Python virtual environment
+# - Python dependencies
+# - Node.js dependencies in all directories
+npm install
 ```
 
 ### 3. Add PDFs & Build Index
