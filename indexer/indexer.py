@@ -15,8 +15,15 @@ import tiktoken
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv(dotenv_path=Path(__file__).parent.parent / "server" / ".env")
+# Load environment variables from root .env file
+root_env_path = Path(__file__).parent.parent / ".env"
+
+if root_env_path.exists():
+    load_dotenv(dotenv_path=root_env_path)
+    print(f"Loaded .env from: {root_env_path}")
+else:
+    print("Warning: No .env file found in root directory. Trying to load from environment variables.")
+    load_dotenv()  # Try loading from current directory or environment
 
 # Configuration
 INPUT_DIR = Path(__file__).parent.parent / "input"
@@ -31,7 +38,18 @@ def get_openai_client() -> OpenAI:
     """Create and return OpenAI client."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable is required")
+        raise ValueError(
+            "OPENAI_API_KEY environment variable is required. "
+            "Please create .env file in the root directory with your API key."
+        )
+    
+    # Basic validation - OpenAI API keys start with 'sk-'
+    if not api_key.startswith("sk-"):
+        raise ValueError(
+            f"Invalid API key format. OpenAI API keys should start with 'sk-'. "
+            f"Got: {api_key[:10]}..."
+        )
+    
     return OpenAI(api_key=api_key)
 
 
@@ -78,11 +96,27 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 def get_embedding(client: OpenAI, text: str) -> list[float]:
     """Get embedding vector for text using OpenAI API."""
-    response = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=text
-    )
-    return response.data[0].embedding
+    try:
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        # Provide more helpful error messages
+        error_msg = str(e)
+        if "401" in error_msg or "invalid_api_key" in error_msg.lower():
+            raise ValueError(
+                "Invalid or expired OpenAI API key. "
+                "Please check your API key in the .env file. "
+                "You can get a new key at https://platform.openai.com/account/api-keys"
+            ) from e
+        elif "429" in error_msg or "rate_limit" in error_msg.lower():
+            raise ValueError(
+                "OpenAI API rate limit exceeded. Please wait a moment and try again."
+            ) from e
+        else:
+            raise
 
 
 def serialize_embedding(embedding: list[float]) -> bytes:
@@ -159,6 +193,25 @@ def build_index():
     """Build the complete index from all PDFs in input directory."""
     print(f"Building index from PDFs in {INPUT_DIR}")
     
+    # Validate API key before starting
+    try:
+        client = get_openai_client()
+        # Test the API key with a simple request
+        print("Validating API key...")
+        test_response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input="test"
+        )
+        print("✓ API key is valid")
+    except Exception as e:
+        print(f"\n❌ API key validation failed: {e}")
+        print("\nPlease check:")
+        print("  1. Your OPENAI_API_KEY in the root .env file")
+        print("  2. The API key is valid and not expired")
+        print("  3. You have sufficient credits in your OpenAI account")
+        print("\nGet a new API key at: https://platform.openai.com/account/api-keys")
+        raise
+    
     # Get all PDF files
     pdf_files = list(INPUT_DIR.glob("*.pdf"))
     if not pdf_files:
@@ -169,7 +222,6 @@ def build_index():
     
     # Initialize database
     conn = init_database(DB_PATH)
-    client = get_openai_client()
     
     total_chunks = 0
     
@@ -193,8 +245,23 @@ def build_index():
                 insert_document(conn, pdf_path.name, chunk, embedding)
                 total_chunks += 1
                 print(f"  Indexed chunk {i + 1}/{len(chunks)}", end="\r")
+            except ValueError as e:
+                # API key or configuration errors - stop processing
+                print(f"\n  ❌ Fatal error: {e}")
+                print(f"  Stopping indexing. Please fix the issue and try again.")
+                conn.close()
+                raise
             except Exception as e:
-                print(f"  Error embedding chunk {i}: {e}")
+                # Other errors - log and continue
+                error_type = type(e).__name__
+                error_msg = str(e)
+                if "401" in error_msg:
+                    print(f"\n  ❌ API key error on chunk {i}: Invalid API key")
+                    print(f"  Please check your OPENAI_API_KEY in the root .env file")
+                    conn.close()
+                    raise ValueError("Invalid API key - stopping indexing") from e
+                else:
+                    print(f"  ⚠️  Error embedding chunk {i}: {error_type}: {error_msg}")
         
         print(f"  Completed {pdf_path.name}")
     

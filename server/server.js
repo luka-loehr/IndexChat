@@ -1,10 +1,16 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 import openai from "./openaiClient.js";
-import { searchPdfs, searchPdfsTool } from "./ragTools.js";
+import { searchPdfs, searchPdfsTool, getIndexedFiles } from "./ragTools.js";
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load .env from root directory
+dotenv.config({ path: path.join(__dirname, "..", ".env") });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -147,19 +153,62 @@ app.post("/ask", async (req, res) => {
   }
 });
 
+// Get indexed files
+app.get("/files", (req, res) => {
+  try {
+    const files = getIndexedFiles();
+    res.json({ files });
+  } catch (error) {
+    console.error("[Error]", error);
+    res.status(500).json({
+      error: "Failed to get indexed files",
+      details: error.message,
+    });
+  }
+});
+
 // Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log("=".repeat(50));
-  console.log("IndexChat Server");
-  console.log("=".repeat(50));
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`\nEndpoints:`);
-  console.log(`  POST /ask    - Ask a question`);
-  console.log(`  GET  /health - Health check`);
-  console.log("=".repeat(50));
-});
+// Function to find an available port
+function findAvailablePort(startPort) {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(startPort, () => {
+      const port = server.address().port;
+      server.close(() => resolve(port));
+    });
+
+    server.on('error', (err) => {
+      if (err.code === 'EADDRINUSE') {
+        // Port is in use, try the next one
+        findAvailablePort(startPort + 1).then(resolve).catch(reject);
+      } else {
+        reject(err);
+      }
+    });
+  });
+}
+
+// Start server with automatic port selection
+findAvailablePort(PORT)
+  .then((availablePort) => {
+    app.listen(availablePort, () => {
+      console.log("=".repeat(50));
+      console.log("IndexChat Server");
+      console.log("=".repeat(50));
+      if (availablePort !== PORT) {
+        console.log(`⚠️  Port ${PORT} was in use, using port ${availablePort} instead`);
+      }
+      console.log(`Server running on http://localhost:${availablePort}`);
+      console.log(`\nEndpoints:`);
+      console.log(`  POST /ask    - Ask a question`);
+      console.log(`  GET  /health - Health check`);
+      console.log("=".repeat(50));
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });

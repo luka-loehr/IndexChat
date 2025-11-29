@@ -13,6 +13,9 @@ A local RAG (Retrieval-Augmented Generation) system for querying PDF documents u
 
 ```
 IndexChat/
+├── .env                    # OpenAI API key (root directory, create from .env.example)
+├── .env.example            # Example environment file
+├── venv/                   # Python virtual environment (root directory)
 ├── input/                  # Drop PDFs here
 ├── indexer/
 │   ├── indexer.py          # PDF indexer
@@ -23,8 +26,7 @@ IndexChat/
 │   ├── server.js           # Express API server
 │   ├── ragTools.js         # Vector search implementation
 │   ├── openaiClient.js     # OpenAI client config
-│   ├── package.json
-│   └── .env                # Your API key (create from .env.example)
+│   └── package.json
 └── ui/
     ├── app/
     │   ├── page.js
@@ -40,10 +42,15 @@ IndexChat/
 
 ### 1. Configure API Key
 
+Create a `.env` file in the root directory with your OpenAI API key:
+
 ```bash
-cp server/.env.example server/.env
-# Edit server/.env and add your OpenAI API key
+# Copy the example file
+cp .env.example .env
+# Edit .env and add your actual OpenAI API key
 ```
+
+**Note:** All parts of the application (indexer, server) load the API key from the root `.env` file. The Python indexer runs in the root virtual environment (`venv/`) and loads the API key from the root `.env` file.
 
 ### 2. Install Dependencies
 

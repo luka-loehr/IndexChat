@@ -5,13 +5,13 @@
   "scripts": {
     "postinstall": "npm run setup",
     "setup": "npm run install:python && npm run install:subdirs",
-    "install:python": "cd indexer && python3 -m venv venv && ./venv/bin/pip install --no-user -r requirements.txt",
+    "install:python": "python3 -m venv venv && ./venv/bin/pip install --no-user -r indexer/requirements.txt",
     "install:subdirs": "cd server && npm install && cd ../ui && npm install",
     "dev": "concurrently -n watcher,server,ui -c blue,green,magenta \"npm run watcher\" \"npm run server\" \"npm run ui\"",
-    "watcher": "cd indexer && ./venv/bin/python watcher.py",
+    "watcher": "./venv/bin/python indexer/watcher.py",
     "server": "cd server && node server.js",
     "ui": "cd ui && npm run dev",
-    "index": "cd indexer && ./venv/bin/python indexer.py --build"
+    "index": "./venv/bin/python indexer/indexer.py --build"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

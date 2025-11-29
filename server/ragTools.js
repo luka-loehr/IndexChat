@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import openai from "./openaiClient.js";
 
@@ -129,6 +130,27 @@ export async function searchPdfs(query, topK = 5) {
     }
 
     return results;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Get list of all indexed files
+ * @returns {Array} Array of unique file names
+ */
+export function getIndexedFiles() {
+  // Return empty array if database doesn't exist yet
+  if (!fs.existsSync(DB_PATH)) {
+    return [];
+  }
+
+  const db = new Database(DB_PATH, { readonly: true });
+  try {
+    const files = db
+      .prepare("SELECT DISTINCT file_name FROM documents ORDER BY file_name")
+      .all();
+    return files.map((f) => f.file_name);
   } finally {
     db.close();
   }
