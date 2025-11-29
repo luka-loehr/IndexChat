@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-IndexChat PDF Watcher
-Watches the input directory for PDF changes and triggers reindexing.
+IndexChat PDF & Image Watcher
+Watches the input directory for PDF and image changes and triggers reindexing.
 """
 
 import subprocess
@@ -18,21 +18,26 @@ INPUT_DIR = Path(__file__).parent.parent / "input"
 INDEXER_SCRIPT = Path(__file__).parent / "indexer.py"
 DEBOUNCE_SECONDS = 2.0
 
+# Supported file extensions
+PDF_EXTENSIONS = {".pdf"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+WATCHED_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS
 
-class PDFWatcherHandler(FileSystemEventHandler):
-    """Handler for PDF file system events with debouncing."""
+
+class FileWatcherHandler(FileSystemEventHandler):
+    """Handler for PDF and image file system events with debouncing."""
     
     def __init__(self):
         super().__init__()
         self._timer: Timer | None = None
         self._is_rebuilding = False
     
-    def _is_pdf_event(self, event: FileSystemEvent) -> bool:
-        """Check if the event is related to a PDF file."""
+    def _is_watched_file(self, event: FileSystemEvent) -> bool:
+        """Check if the event is related to a watched file (PDF or image)."""
         if event.is_directory:
             return False
         src_path = Path(event.src_path)
-        return src_path.suffix.lower() == ".pdf"
+        return src_path.suffix.lower() in WATCHED_EXTENSIONS
     
     def _schedule_rebuild(self):
         """Schedule a rebuild with debouncing."""
@@ -72,26 +77,30 @@ class PDFWatcherHandler(FileSystemEventHandler):
     
     def on_created(self, event: FileSystemEvent):
         """Handle file creation."""
-        if self._is_pdf_event(event):
-            print(f"PDF created: {Path(event.src_path).name}")
+        if self._is_watched_file(event):
+            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
+            print(f"{file_type} created: {Path(event.src_path).name}")
             self._schedule_rebuild()
     
     def on_modified(self, event: FileSystemEvent):
         """Handle file modification."""
-        if self._is_pdf_event(event):
-            print(f"PDF modified: {Path(event.src_path).name}")
+        if self._is_watched_file(event):
+            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
+            print(f"{file_type} modified: {Path(event.src_path).name}")
             self._schedule_rebuild()
     
     def on_deleted(self, event: FileSystemEvent):
         """Handle file deletion."""
-        if self._is_pdf_event(event):
-            print(f"PDF deleted: {Path(event.src_path).name}")
+        if self._is_watched_file(event):
+            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
+            print(f"{file_type} deleted: {Path(event.src_path).name}")
             self._schedule_rebuild()
     
     def on_moved(self, event: FileSystemEvent):
         """Handle file move/rename."""
-        if self._is_pdf_event(event):
-            print(f"PDF moved: {Path(event.src_path).name}")
+        if self._is_watched_file(event):
+            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
+            print(f"{file_type} moved: {Path(event.src_path).name}")
             self._schedule_rebuild()
 
 
@@ -101,15 +110,15 @@ def main():
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     print("=" * 50)
-    print("IndexChat PDF Watcher")
+    print("IndexChat PDF & Image Watcher")
     print("=" * 50)
     print(f"\nWatching directory: {INPUT_DIR}")
     print(f"Debounce delay: {DEBOUNCE_SECONDS} seconds")
-    print("\nWaiting for PDF changes...")
+    print("\nWaiting for PDF and image changes...")
     print("Press Ctrl+C to stop\n")
     
     # Set up the observer
-    event_handler = PDFWatcherHandler()
+    event_handler = FileWatcherHandler()
     observer = Observer()
     observer.schedule(event_handler, str(INPUT_DIR), recursive=False)
     observer.start()
