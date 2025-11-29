@@ -13,8 +13,8 @@ const envPath = path.join(__dirname, "..", ".env");
 // Temporarily unset the environment variable to ensure .env takes precedence
 delete process.env.OPENAI_API_KEY;
 
-// Load .env file
-const result = dotenv.config({ path: envPath });
+// Load .env file with override to ensure it takes precedence
+const result = dotenv.config({ path: envPath, override: true });
 
 if (result.error) {
   throw new Error(`Failed to load .env file: ${result.error.message}`);
@@ -23,13 +23,21 @@ if (result.error) {
 // Read the key directly from .env file to ensure we're using it
 const envContent = fs.readFileSync(envPath, 'utf8');
 const envLines = envContent.split('\n');
-const apiKeyLine = envLines.find(line => line.startsWith('OPENAI_API_KEY='));
+const apiKeyLine = envLines.find(line => line.trim().startsWith('OPENAI_API_KEY='));
 
 if (!apiKeyLine) {
   throw new Error("OPENAI_API_KEY not found in .env file");
 }
 
-const apiKey = apiKeyLine.split('=')[1]?.trim();
+// Extract the value, handling quoted values
+let apiKey = apiKeyLine.split('=').slice(1).join('=').trim();
+
+// Remove quotes if present
+if ((apiKey.startsWith('"') && apiKey.endsWith('"')) || 
+    (apiKey.startsWith("'") && apiKey.endsWith("'"))) {
+  apiKey = apiKey.slice(1, -1).trim();
+}
+
 if (!apiKey) {
   throw new Error("OPENAI_API_KEY is empty in .env file");
 }
