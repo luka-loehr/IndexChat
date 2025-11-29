@@ -1,0 +1,17 @@
+{
+  "name": "indexchat",
+  "version": "1.0.0",
+  "description": "Local RAG system for PDF documents",
+  "scripts": {
+    "dev": "concurrently -n watcher,server,ui -c blue,green,magenta \"npm run watcher\" \"npm run server\" \"npm run ui\"",
+    "watcher": "cd indexer && ./venv/bin/python watcher.py",
+    "server": "cd server && node server.js",
+    "ui": "cd ui && npm run dev",
+    "index": "cd indexer && ./venv/bin/python indexer.py --build",
+    "install:all": "npm install && cd server && npm install && cd ../ui && npm install",
+    "install:python": "cd indexer && python3 -m venv venv && ./venv/bin/pip install -r requirements.txt"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
