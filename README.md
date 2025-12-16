@@ -1,111 +1,85 @@
-# IndexChat
+# IndexChat Workbench
 
-A local RAG (Retrieval-Augmented Generation) system for querying PDF documents using GPT-4 with tool calling.
+A modern, "Workbench" style AI assistant for your documents, powered by local RAG (Retrieval-Augmented Generation).
+
+## Features
+
+-   **3-Column Workbench UI**: specialized areas for Sources, Thinking (Chat), and Tools.
+-   **Multi-Modal Support**: Indexes and understands:
+    -   PDFs
+    -   Word Documents (.docx)
+    -   PowerPoint Presentations (.pptx)
+    -   Images (via CLIP embeddings)
+    -   Audio/Video (via Transcription)
+    -   Text/Markdown files
+-   **Local & Private**: Runs locally using OpenAI embeddings and GPT-4 for generation (keys required).
+-   **Auto-Indexing**: Watcher detects new files in `input/` and updates the index immediately.
 
 ## Architecture
 
-- **Python Indexer**: Extracts text from PDFs, chunks it, embeds with `text-embedding-3-large`, stores in SQLite-VSS
-- **PDF Watcher**: Monitors the input folder and auto-rebuilds the index when PDFs change
-- **Node.js Backend**: Express server with GPT-4o tool calling for RAG queries
-- **Next.js Frontend**: Clean UI for asking questions and viewing answers with sources
+-   **Frontend**: Next.js 14 (App Router) with a dark, muted "professional" design.
+-   **Backend**: Node.js Express server handling uploads and RAG queries.
+-   **Indexer**: Python script using `sqlite-vss` for vector search and `transformers`/`openai` for embeddings.
 
 ## Project Structure
 
 ```
 IndexChat/
-├── .env                    # OpenAI API key (root directory, create from .env.example)
-├── .env.example            # Example environment file
-├── venv/                   # Python virtual environment (root directory)
-├── input/                  # Drop PDFs here
+├── .env                    # API keys
+├── input/                  # Document ingestion folder
 ├── indexer/
-│   ├── indexer.py          # PDF indexer
-│   ├── watcher.py          # File watcher for auto-reindexing
-│   ├── requirements.txt
-│   └── database.sqlite     # Generated vector database
+│   ├── indexer.py          # Main indexing logic
+│   ├── watcher.py          # File system watcher
+│   └── requirements.txt    # Python dependencies
 ├── server/
-│   ├── server.js           # Express API server
-│   ├── ragTools.js         # Vector search implementation
-│   ├── openaiClient.js     # OpenAI client config
-│   └── package.json
-└── ui/
-    ├── app/
-    │   ├── page.js
-    │   ├── layout.js
-    │   └── globals.css
-    ├── Components/
-    │   └── ChatBox.jsx
-    ├── package.json
-    └── next.config.js
+│   ├── server.js           # API Server
+│   └── ragTools.js         # RAG implementation
+└── ui/                     # Next.js Frontend
 ```
 
-## Setup
+## Setup & Usage
 
-### 1. Configure API Key
+### 1. Prerequisites
+-   Node.js 18+
+-   Python 3.10+
+-   OpenAI API Key (for Embeddings and Chat)
 
-Create a `.env` file in the root directory with your OpenAI API key:
-
-```bash
-# Copy the example file
-cp .env.example .env
-# Edit .env and add your actual OpenAI API key
-```
-
-**Note:** All parts of the application (indexer, server) load the API key from the root `.env` file. The Python indexer runs in the root virtual environment (`venv/`) and loads the API key from the root `.env` file.
-
-### 2. Install Dependencies
+### 2. Installation
 
 ```bash
-# This automatically sets up everything:
-# - Python virtual environment
-# - Python dependencies
-# - Node.js dependencies in all directories
+# Install all dependencies (Node.js & Python)
 npm install
 ```
 
-### 3. Add PDFs & Build Index
+### 3. Configuration
 
-```bash
-# Drop PDF files into input/ directory, then:
-npm run index
+Create a `.env` file in the root directory:
+
+```env
+OPENAI_API_KEY=sk-your-key-here
 ```
 
-### 4. Start Everything
+### 4. Running the Workbench
+
+Start all services (Frontend, Backend, Watcher) with one command:
 
 ```bash
 npm run dev
 ```
 
-This starts the watcher, backend, and frontend concurrently.
+-   **Frontend**: http://localhost:3000
+-   **Backend**: http://localhost:3001
 
-## Usage
+### 5. Adding Sources
+You can add sources in two ways:
+1.  **Drag & Drop**: Use the "Add Sources" button in the UI or drag files into the `input/` folder.
+2.  **Auto-Sync**: Any file added to the `input/` folder is automatically detected and indexed.
 
-1. Open http://localhost:3000 in your browser
-2. Type a question about your documents
-3. The system will search the indexed PDFs and return an answer with sources
+## supported File Types
+-   **Documents**: PDF, DOCX, PPTX, TXT, MD
+-   **Images**: JPG, PNG, WEBP (Searchable by content description)
+-   **Audio/Video**: MP3, MP4, WAV (Transcribed and indexed)
 
-## API
-
-### POST /ask
-
-Request:
-```json
-{
-  "query": "What is the main topic of the documents?"
-}
-```
-
-Response:
-```json
-{
-  "answer": "Based on the documents...",
-  "sources": [
-    { "id": 1, "file_name": "document.pdf" }
-  ]
-}
-```
-
-## Notes
-
-- The indexer uses ~800-token chunks with 100-token overlap
-- SQLite-VSS extension is optional; falls back to brute-force cosine similarity if not available
-- The watcher has a 2-second debounce to batch rapid file changes
+## Troubleshooting
+-   **Missing Python Packages**: If the indexer fails, try manually installing dependencies: `pip install -r indexer/requirements.txt`
+-   **Database Locks**: If the indexer hangs, remove `indexer/database.sqlite` and restart.

@@ -3,6 +3,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import multer from "multer";
+import fs from "fs";
 import openai from "./openaiClient.js";
 import { searchPdfs, searchPdfsTool, getIndexedFiles } from "./ragTools.js";
 
@@ -18,6 +20,24 @@ const PORT = process.env.PORT || 3001;
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Configure Multer for file uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, "..", "input");
+    // Ensure directory exists
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Keep original filename
+    cb(null, file.originalname);
+  }
+});
+
+const upload = multer({ storage: storage });
 
 // System prompt for the assistant
 const SYSTEM_PROMPT = `You are a helpful assistant that answers questions based on the user's PDF documents.
@@ -153,6 +173,30 @@ app.post("/ask", async (req, res) => {
   }
 });
 
+// Upload files
+app.post("/upload", upload.array("files"), (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    console.log(`[Upload] Received ${req.files.length} files`);
+    
+    // The watcher will detect the new files and trigger indexing
+    
+    res.json({ 
+      message: "Files uploaded successfully", 
+      files: req.files.map(f => f.originalname) 
+    });
+  } catch (error) {
+    console.error("[Error]", error);
+    res.status(500).json({
+      error: "Failed to upload files",
+      details: error.message,
+    });
+  }
+});
+
 // Get indexed files
 app.get("/files", (req, res) => {
   try {
@@ -204,6 +248,8 @@ findAvailablePort(PORT)
       console.log(`Server running on http://localhost:${availablePort}`);
       console.log(`\nEndpoints:`);
       console.log(`  POST /ask    - Ask a question`);
+      console.log(`  POST /upload - Upload files`);
+      console.log(`  GET  /files  - List indexed files`);
       console.log(`  GET  /health - Health check`);
       console.log("=".repeat(50));
     });
