@@ -25,8 +25,9 @@ This project uses a **Local-First / Cloud-Powered** architecture. The heavy ML l
         *   **Speech**: Transcription via **OpenAI Whisper** -> Text Embedding.
         *   **Acoustics**: Sound event detection via **Hugging Face `laion/clap-htsat-unfused`** (CLAP).
     *   **🎥 Video**:
-        *   **Visuals**: Extracts frames every 10 seconds -> CLIP Embeddings (with timestamp metadata).
-        *   **Audio Track**: Extracted via `moviepy` -> processed as Audio (Speech + Acoustics).
+        *   **Visuals**: Extracts frames every 10 seconds -> CLIP Embeddings (allows searching for visual content like "red car").
+        *   **Speech**: Extracted audio -> Whisper Transcription (allows searching for spoken words).
+        *   **Acoustics**: Extracted audio -> CLAP Embeddings (allows searching for sounds like "applause" or "siren").
 *   **Database**: **SQLite** with `sqlite-vss` extension for high-performance local vector search.
 
 ## 🚀 Setup & Usage
@@ -66,7 +67,7 @@ This project uses a **Local-First / Cloud-Powered** architecture. The heavy ML l
 | **Documents** | PDF, DOCX, PPTX, TXT, MD | Text Search |
 | **Images** | JPG, PNG, WEBP | Visual Description Search (CLIP) |
 | **Audio** | MP3, WAV, M4A | Speech (Whisper) + Sound Events (CLAP) |
-| **Video** | MP4, MOV, AVI | Visual Frames (every 10s) + Speech + Sound Events |
+| **Video** | MP4, MOV, AVI | **Visual Frames** (every 10s) + **Speech** (Whisper) + **Sound Events** (CLAP) |
 
 ## 💡 Usage Examples
 
