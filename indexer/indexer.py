@@ -13,6 +13,8 @@ import base64
 from pathlib import Path
 import mimetypes
 import requests
+import cv2
+import numpy as np
 
 import tiktoken
 from openai import OpenAI
@@ -55,8 +57,7 @@ HF_AUDIO_MODEL = "laion/clap-htsat-unfused"
 # Dimensions
 TEXT_EMBED_DIM = 3072
 IMAGE_EMBED_DIM = 512
-AUDIO_EMBED_DIM = 512 # CLAP projection dimension usually 512 or 768. Check model card.
-                      # laion/clap-htsat-unfused outputs 512 usually.
+AUDIO_EMBED_DIM = 512
                       
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
@@ -65,7 +66,7 @@ CHUNK_OVERLAP = 100
 DOC_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".md"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"} # Video = Image (frame) + Audio
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
 
 def get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -76,7 +77,6 @@ def get_openai_client() -> OpenAI:
 def get_hf_headers():
     token = os.getenv("HUGGINGFACE_API_KEY")
     if not token:
-        # Fallback or warn? Better to warn.
         print("⚠️ HUGGINGFACE_API_KEY not found. Image/Audio embeddings will fail.")
         return {}
     return {"Authorization": f"Bearer {token}"}
@@ -87,11 +87,10 @@ def query_hf_api(model_id, data, retries=3):
     
     for i in range(retries):
         try:
-            response = requests.post(api_url, headers=headers, json=data) # or data=data depending on endpoint
+            response = requests.post(api_url, headers=headers, json=data)
             if response.status_code == 200:
                 return response.json()
             else:
-                # If model is loading, wait
                 err = response.json()
                 if "error" in err and "loading" in err["error"].lower():
                     wait_time = err.get("estimated_time", 20)
@@ -104,33 +103,26 @@ def query_hf_api(model_id, data, retries=3):
         time.sleep(2)
     return None
 
-def get_hf_image_embedding(image_path: Path):
-    # Read image and base64 encode
-    with open(image_path, "rb") as img_file:
-        b64_image = base64.b64encode(img_file.read()).decode('utf-8')
-    
-    # HF Feature Extraction API for CLIP often expects raw string or specialized payload
-    # Standard Feature Extraction for CLIP on HF usually works with raw bytes? 
-    # Actually, the 'feature-extraction' pipeline on HF Inference API is tricky for multimodal.
-    # A better way is to use the "zero-shot-image-classification" or similar, BUT we want the embedding.
-    # Many CLIP models on HF Inference API return the pooled output or last hidden state.
-    # Let's try sending the image data directly.
-    
-    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_IMAGE_MODEL}"
+def get_hf_image_embedding(image_path=None, image_data=None):
+    # Support both path and direct bytes
     headers = get_hf_headers()
-    with open(image_path, "rb") as f:
-        data = f.read()
+    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_IMAGE_MODEL}"
+    
+    data = image_data
+    if image_path:
+        with open(image_path, "rb") as f:
+            data = f.read()
+            
+    if not data: return None
         
     response = requests.post(api_url, headers=headers, data=data)
     if response.status_code != 200:
         print(f"Error getting image embedding: {response.text}")
         return None
         
-    # Result is usually a list of floats (the embedding)
     return response.json()
 
 def get_hf_audio_embedding(audio_path: Path):
-    # Similarly for CLAP
     api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_AUDIO_MODEL}"
     headers = get_hf_headers()
     with open(audio_path, "rb") as f:
@@ -142,7 +134,36 @@ def get_hf_audio_embedding(audio_path: Path):
         return None
     return response.json()
 
-# ... Text extraction functions (same as before) ...
+def extract_key_frames(video_path: Path, num_frames=3):
+    """Extract key frames from video for visual indexing"""
+    frames = []
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened(): return []
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0: return []
+        
+        # Calculate timestamps to extract (start, middle, end)
+        indices = np.linspace(0, total_frames-1, num_frames, dtype=int)
+        
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                # Convert to JPEG bytes
+                is_success, buffer = cv2.imencode(".jpg", frame)
+                if is_success:
+                    frames.append({
+                        "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0,
+                        "data": buffer.tobytes()
+                    })
+        cap.release()
+    except Exception as e:
+        print(f"Frame extraction error: {e}")
+    return frames
+
+# ... Text extraction functions ...
 def extract_text_from_pdf(pdf_path: Path) -> str:
     if not pdfplumber: return ""
     text = ""
@@ -179,7 +200,6 @@ def extract_text_from_txt(txt_path: Path) -> str:
 def transcribe_audio(client: OpenAI, audio_path: Path) -> str:
     try:
         with open(audio_path, "rb") as audio_file:
-            # Check file size, if > 25MB needs splitting, but ignoring for now
             return client.audio.transcriptions.create(model="whisper-1", file=audio_file).text
     except Exception as e:
         print(f"Transcription error: {e}")
@@ -226,7 +246,6 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     """)
     
     try:
-        # Tables for different spaces
         conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_text USING vss0(embedding({TEXT_EMBED_DIM}))")
         conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_image USING vss0(embedding({IMAGE_EMBED_DIM}))")
         conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_audio USING vss0(embedding({AUDIO_EMBED_DIM}))")
@@ -284,12 +303,12 @@ def build_index():
         # 2. Images
         elif ext in IMAGE_EXTENSIONS:
             print("  Generating cloud CLIP embedding...")
-            emb = get_hf_image_embedding(file_path)
+            emb = get_hf_image_embedding(image_path=file_path)
             if emb:
                 insert_document(conn, file_path.name, "image", f"Image: {file_path.name}", emb, IMAGE_EMBED_DIM)
                 total_chunks += 1
         
-        # 3. Audio / Video (Treat Video as Audio+Image later, for now just Audio/Transcribe)
+        # 3. Audio / Video
         elif ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS:
             # A. Transcribe (Text)
             print("  Transcribing...")
@@ -302,16 +321,26 @@ def build_index():
                     total_chunks += 1
             
             # B. Audio Embedding (CLAP) - for "sound search"
-            if ext in AUDIO_EXTENSIONS: # HF CLAP might fail on large video files
+            if ext in AUDIO_EXTENSIONS:
                 print("  Generating cloud Audio embedding...")
                 emb = get_hf_audio_embedding(file_path)
-                # HF API sometimes returns nested list [[...]] or error
                 if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
-                    emb = emb[0] # Unwrap batch
+                    emb = emb[0]
                 
                 if emb and isinstance(emb, list):
                     insert_document(conn, file_path.name, "audio", f"Audio File: {file_path.name}", emb, AUDIO_EMBED_DIM)
                     total_chunks += 1
+            
+            # C. Video Visual Frames (CLIP)
+            if ext in VIDEO_EXTENSIONS:
+                print("  Extracting visual key frames...")
+                frames = extract_key_frames(file_path, num_frames=3)
+                for i, frame in enumerate(frames):
+                    print(f"    Embedding frame {i+1} at {frame['timestamp']:.1f}s...")
+                    emb = get_hf_image_embedding(image_data=frame['data'])
+                    if emb:
+                        insert_document(conn, file_path.name, "image", f"Video Frame: {file_path.name} ({frame['timestamp']:.1f}s)", emb, IMAGE_EMBED_DIM)
+                        total_chunks += 1
 
     conn.commit()
     conn.close()
