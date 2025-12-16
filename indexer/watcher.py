@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 IndexChat PDF & Image Watcher
-Watches the input directory for PDF and image changes and triggers reindexing.
+Watches the input directory for documents and image changes and triggers reindexing.
 """
 
 import subprocess
@@ -19,13 +19,15 @@ INDEXER_SCRIPT = Path(__file__).parent / "indexer.py"
 DEBOUNCE_SECONDS = 2.0
 
 # Supported file extensions
-PDF_EXTENSIONS = {".pdf"}
+DOC_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".md"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-WATCHED_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
+WATCHED_EXTENSIONS = DOC_EXTENSIONS | IMAGE_EXTENSIONS | AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 
 
 class FileWatcherHandler(FileSystemEventHandler):
-    """Handler for PDF and image file system events with debouncing."""
+    """Handler for file system events with debouncing."""
     
     def __init__(self):
         super().__init__()
@@ -33,7 +35,7 @@ class FileWatcherHandler(FileSystemEventHandler):
         self._is_rebuilding = False
     
     def _is_watched_file(self, event: FileSystemEvent) -> bool:
-        """Check if the event is related to a watched file (PDF or image)."""
+        """Check if the event is related to a watched file."""
         if event.is_directory:
             return False
         src_path = Path(event.src_path)
@@ -78,29 +80,25 @@ class FileWatcherHandler(FileSystemEventHandler):
     def on_created(self, event: FileSystemEvent):
         """Handle file creation."""
         if self._is_watched_file(event):
-            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
-            print(f"{file_type} created: {Path(event.src_path).name}")
+            print(f"File created: {Path(event.src_path).name}")
             self._schedule_rebuild()
     
     def on_modified(self, event: FileSystemEvent):
         """Handle file modification."""
         if self._is_watched_file(event):
-            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
-            print(f"{file_type} modified: {Path(event.src_path).name}")
+            print(f"File modified: {Path(event.src_path).name}")
             self._schedule_rebuild()
     
     def on_deleted(self, event: FileSystemEvent):
         """Handle file deletion."""
         if self._is_watched_file(event):
-            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
-            print(f"{file_type} deleted: {Path(event.src_path).name}")
+            print(f"File deleted: {Path(event.src_path).name}")
             self._schedule_rebuild()
     
     def on_moved(self, event: FileSystemEvent):
         """Handle file move/rename."""
         if self._is_watched_file(event):
-            file_type = "PDF" if Path(event.src_path).suffix.lower() == ".pdf" else "Image"
-            print(f"{file_type} moved: {Path(event.src_path).name}")
+            print(f"File moved: {Path(event.src_path).name}")
             self._schedule_rebuild()
 
 
@@ -110,11 +108,11 @@ def main():
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     print("=" * 50)
-    print("IndexChat PDF & Image Watcher")
+    print("IndexChat File Watcher")
     print("=" * 50)
     print(f"\nWatching directory: {INPUT_DIR}")
     print(f"Debounce delay: {DEBOUNCE_SECONDS} seconds")
-    print("\nWaiting for PDF and image changes...")
+    print("\nWaiting for file changes...")
     print("Press Ctrl+C to stop\n")
     
     # Set up the observer

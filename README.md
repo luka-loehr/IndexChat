@@ -1,111 +1,45 @@
-# IndexChat
+# IndexChat Workbench (Cloud Edition)
 
-A local RAG (Retrieval-Augmented Generation) system for querying PDF documents using GPT-4 with tool calling.
+A professional AI workbench for your documents, powered by Cloud APIs (OpenAI + Hugging Face).
 
-## Architecture
+## Features
 
-- **Python Indexer**: Extracts text from PDFs, chunks it, embeds with `text-embedding-3-large`, stores in SQLite-VSS
-- **PDF Watcher**: Monitors the input folder and auto-rebuilds the index when PDFs change
-- **Node.js Backend**: Express server with GPT-4o tool calling for RAG queries
-- **Next.js Frontend**: Clean UI for asking questions and viewing answers with sources
-
-## Project Structure
-
-```
-IndexChat/
-├── .env                    # OpenAI API key (root directory, create from .env.example)
-├── .env.example            # Example environment file
-├── venv/                   # Python virtual environment (root directory)
-├── input/                  # Drop PDFs here
-├── indexer/
-│   ├── indexer.py          # PDF indexer
-│   ├── watcher.py          # File watcher for auto-reindexing
-│   ├── requirements.txt
-│   └── database.sqlite     # Generated vector database
-├── server/
-│   ├── server.js           # Express API server
-│   ├── ragTools.js         # Vector search implementation
-│   ├── openaiClient.js     # OpenAI client config
-│   └── package.json
-└── ui/
-    ├── app/
-    │   ├── page.js
-    │   ├── layout.js
-    │   └── globals.css
-    ├── Components/
-    │   └── ChatBox.jsx
-    ├── package.json
-    └── next.config.js
-```
+-   **Cloud-First Architecture**: No heavy local models. Uses:
+    -   **OpenAI `text-embedding-3-large`** for text.
+    -   **OpenAI `gpt-4o`** for reasoning and chat.
+    -   **Hugging Face Inference API** for Multimodal Embeddings:
+        -   Image: `openai/clip-vit-base-patch32` (CLIP)
+        -   Audio: `laion/clap-htsat-unfused` (CLAP)
+-   **Multi-Modal Search**:
+    -   Search text with text.
+    -   Search images with text descriptions.
+    -   Search audio with text descriptions (e.g. "sound of rain").
+-   **Workbench UI**: Clean, 3-column layout for serious work.
 
 ## Setup
 
-### 1. Configure API Key
+1.  **Install Dependencies**:
+    ```bash
+    npm install
+    ```
 
-Create a `.env` file in the root directory with your OpenAI API key:
+2.  **Configure Environment**:
+    Create `.env` in the root directory:
+    ```env
+    OPENAI_API_KEY=sk-proj-...
+    HUGGINGFACE_API_KEY=hf_...  # Required for Image/Audio indexing
+    ```
 
-```bash
-# Copy the example file
-cp .env.example .env
-# Edit .env and add your actual OpenAI API key
-```
-
-**Note:** All parts of the application (indexer, server) load the API key from the root `.env` file. The Python indexer runs in the root virtual environment (`venv/`) and loads the API key from the root `.env` file.
-
-### 2. Install Dependencies
-
-```bash
-# This automatically sets up everything:
-# - Python virtual environment
-# - Python dependencies
-# - Node.js dependencies in all directories
-npm install
-```
-
-### 3. Add PDFs & Build Index
-
-```bash
-# Drop PDF files into input/ directory, then:
-npm run index
-```
-
-### 4. Start Everything
-
-```bash
-npm run dev
-```
-
-This starts the watcher, backend, and frontend concurrently.
+3.  **Run**:
+    ```bash
+    npm run dev
+    ```
 
 ## Usage
 
-1. Open http://localhost:3000 in your browser
-2. Type a question about your documents
-3. The system will search the indexed PDFs and return an answer with sources
+-   **Add Sources**: Drag files into the UI or `input/` folder.
+-   **Supported Formats**: PDF, DOCX, PPTX, TXT, JPG, PNG, MP3, WAV, MP4.
+-   **Search**: Type "Find documents about X" or "Find images of a cat" or "Find audio of applause".
 
-## API
-
-### POST /ask
-
-Request:
-```json
-{
-  "query": "What is the main topic of the documents?"
-}
-```
-
-Response:
-```json
-{
-  "answer": "Based on the documents...",
-  "sources": [
-    { "id": 1, "file_name": "document.pdf" }
-  ]
-}
-```
-
-## Notes
-
-- The indexer uses ~800-token chunks with 100-token overlap
-- SQLite-VSS extension is optional; falls back to brute-force cosine similarity if not available
-- The watcher has a 2-second debounce to batch rapid file changes
+## Note on Video
+Videos are treated as Audio (Transcription + CLAP embedding). Visual frame extraction is currently simplified to filename-based or future expansion.

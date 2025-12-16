@@ -3,6 +3,8 @@ import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import multer from "multer";
+import fs from "fs";
 import openai from "./openaiClient.js";
 import { searchPdfs, searchPdfsTool, getIndexedFiles } from "./ragTools.js";
 
@@ -19,6 +21,24 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Configure Multer for file uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const uploadDir = path.join(__dirname, "..", "input");
+    // Ensure directory exists
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    cb(null, uploadDir);
+  },
+  filename: function (req, file, cb) {
+    // Keep original filename
+    cb(null, file.originalname);
+  }
+});
+
+const upload = multer({ storage: storage });
+
 // System prompt for the assistant
 const SYSTEM_PROMPT = `You are a helpful assistant that answers questions based on the user's PDF documents.
 When answering questions:
@@ -27,6 +47,9 @@ When answering questions:
 3. ALWAYS cite your sources by mentioning which document (file name) the information came from
 4. If the documents don't contain relevant information, say so clearly
 5. Be concise but thorough in your answers`;
+
+// Model Selection
+const CHAT_MODEL = "gpt-4o";
 
 /**
  * Process a user query with GPT-4 tool calling
@@ -42,7 +65,7 @@ async function processQuery(query) {
 
   // Initial call to GPT-4
   let response = await openai.chat.completions.create({
-    model: "gpt-4o",
+    model: CHAT_MODEL,
     messages,
     tools,
     tool_choice: "auto",
@@ -82,7 +105,7 @@ async function processQuery(query) {
           const formattedResults = results
             .map(
               (r, i) =>
-                `[${i + 1}] File: ${r.file_name} (ID: ${r.id})\n${r.chunk_text}`
+                `[${i + 1}] File: ${r.file_name} (Type: ${r.content_type || 'text'})\n${r.chunk_text}`
             )
             .join("\n\n---\n\n");
 
@@ -112,7 +135,7 @@ async function processQuery(query) {
 
     // Get next response from GPT
     response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: CHAT_MODEL,
       messages,
       tools,
       tool_choice: "auto",
@@ -148,6 +171,30 @@ app.post("/ask", async (req, res) => {
     console.error("[Error]", error);
     res.status(500).json({
       error: "Failed to process query",
+      details: error.message,
+    });
+  }
+});
+
+// Upload files
+app.post("/upload", upload.array("files"), (req, res) => {
+  try {
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: "No files uploaded" });
+    }
+
+    console.log(`[Upload] Received ${req.files.length} files`);
+    
+    // The watcher will detect the new files and trigger indexing
+    
+    res.json({ 
+      message: "Files uploaded successfully", 
+      files: req.files.map(f => f.originalname) 
+    });
+  } catch (error) {
+    console.error("[Error]", error);
+    res.status(500).json({
+      error: "Failed to upload files",
       details: error.message,
     });
   }
@@ -204,6 +251,8 @@ findAvailablePort(PORT)
       console.log(`Server running on http://localhost:${availablePort}`);
       console.log(`\nEndpoints:`);
       console.log(`  POST /ask    - Ask a question`);
+      console.log(`  POST /upload - Upload files`);
+      console.log(`  GET  /files  - List indexed files`);
       console.log(`  GET  /health - Health check`);
       console.log("=".repeat(50));
     });

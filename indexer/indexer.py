@@ -1,221 +1,271 @@
 #!/usr/bin/env python3
 """
-IndexChat PDF & Image Indexer
-Indexes PDF documents and images into SQLite-VSS for vector search.
+IndexChat Cloud-First Indexer
+Indexes documents using OpenAI and Hugging Face APIs.
 """
 
 import argparse
 import os
 import struct
 import sqlite3
+import time
+import base64
 from pathlib import Path
+import mimetypes
+import requests
+import cv2
+import numpy as np
+import tempfile
 
-import pdfplumber
 import tiktoken
 from openai import OpenAI
 from dotenv import load_dotenv
 from PIL import Image
-import torch
-from transformers import CLIPProcessor, CLIPModel
 
-# Load environment variables from root .env file
-# Use override=True to ensure .env file takes precedence over existing environment variables
+# Import moviepy for audio extraction
+try:
+    from moviepy import VideoFileClip
+except ImportError:
+    VideoFileClip = None
+
+# Optional imports for document handling
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
+
+# Load environment variables
 root_env_path = Path(__file__).parent.parent / ".env"
 
 if root_env_path.exists():
     load_dotenv(dotenv_path=root_env_path, override=True)
-    print(f"Loaded .env from: {root_env_path}")
 else:
-    print("Warning: No .env file found in root directory. Trying to load from environment variables.")
-    load_dotenv(override=True)  # Try loading from current directory or environment
+    load_dotenv(override=True)
 
 # Configuration
 INPUT_DIR = Path(__file__).parent.parent / "input"
 DB_PATH = Path(__file__).parent / "database.sqlite"
-EMBEDDING_MODEL = "text-embedding-3-large"
-EMBEDDING_DIMENSIONS = 3072
-CLIP_EMBEDDING_DIMENSIONS = 512  # CLIP produces 512-dimensional embeddings
-CHUNK_SIZE = 800  # tokens
-CHUNK_OVERLAP = 100  # tokens
 
-# Supported image formats
+# Models
+OPENAI_TEXT_EMBED_MODEL = "text-embedding-3-large"
+HF_IMAGE_MODEL = "openai/clip-vit-base-patch32"
+HF_AUDIO_MODEL = "laion/clap-htsat-unfused" 
+
+# Dimensions
+TEXT_EMBED_DIM = 3072
+IMAGE_EMBED_DIM = 512
+AUDIO_EMBED_DIM = 512
+                      
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
+
+# File Extensions
+DOC_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".md"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-
-
-# Global CLIP model cache
-_clip_model = None
-_clip_processor = None
-
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"}
 
 def get_openai_client() -> OpenAI:
-    """Create and return OpenAI client."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY environment variable is required. "
-            "Please create .env file in the root directory with your API key."
-        )
-    
-    # Strip whitespace and newlines that might be in the .env file
-    api_key = api_key.strip()
-    
-    # Remove quotes if present (sometimes .env files have quoted values)
-    if (api_key.startswith('"') and api_key.endswith('"')) or \
-       (api_key.startswith("'") and api_key.endswith("'")):
-        api_key = api_key[1:-1].strip()
-    
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY is empty after stripping whitespace. "
-            "Please check your .env file."
-        )
-    
-    # Basic validation - OpenAI API keys start with 'sk-'
-    if not api_key.startswith("sk-"):
-        raise ValueError(
-            f"Invalid API key format. OpenAI API keys should start with 'sk-'. "
-            f"Got: {api_key[:20]}... (length: {len(api_key)})"
-        )
-    
+        raise ValueError("OPENAI_API_KEY environment variable is required.")
     return OpenAI(api_key=api_key)
 
+def get_hf_headers():
+    token = os.getenv("HUGGINGFACE_API_KEY")
+    if not token:
+        print("⚠️ HUGGINGFACE_API_KEY not found. Image/Audio embeddings will fail.")
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
-def get_clip_model():
-    """Get or initialize CLIP model and processor."""
-    global _clip_model, _clip_processor
+def query_hf_api(model_id, data, retries=3):
+    api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = get_hf_headers()
     
-    if _clip_model is None or _clip_processor is None:
-        print("Loading CLIP model...")
-        model_name = "openai/clip-vit-base-patch32"
-        _clip_model = CLIPModel.from_pretrained(model_name)
-        _clip_processor = CLIPProcessor.from_pretrained(model_name)
+    for i in range(retries):
+        try:
+            response = requests.post(api_url, headers=headers, json=data)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                err = response.json()
+                if "error" in err and "loading" in err["error"].lower():
+                    wait_time = err.get("estimated_time", 20)
+                    print(f"Model {model_id} loading, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                print(f"Error querying HF API ({model_id}): {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"Exception querying HF API: {e}")
+        time.sleep(2)
+    return None
+
+def get_hf_image_embedding(image_path=None, image_data=None):
+    # Support both path and direct bytes
+    headers = get_hf_headers()
+    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_IMAGE_MODEL}"
+    
+    data = image_data
+    if image_path:
+        with open(image_path, "rb") as f:
+            data = f.read()
+            
+    if not data: return None
         
-        # Use CPU if CUDA is not available
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _clip_model = _clip_model.to(device)
-        _clip_model.eval()
-        print(f"CLIP model loaded on {device}")
-    
-    return _clip_model, _clip_processor
+    response = requests.post(api_url, headers=headers, data=data)
+    if response.status_code != 200:
+        print(f"Error getting image embedding: {response.text}")
+        return None
+        
+    return response.json()
 
+def get_hf_audio_embedding(audio_path: Path):
+    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_AUDIO_MODEL}"
+    headers = get_hf_headers()
+    with open(audio_path, "rb") as f:
+        data = f.read()
+        
+    response = requests.post(api_url, headers=headers, data=data)
+    if response.status_code != 200:
+        print(f"Error getting audio embedding: {response.text}")
+        return None
+    return response.json()
 
+def extract_audio_from_video(video_path: Path):
+    """Extract audio from video to a temporary MP3 file"""
+    if not VideoFileClip:
+        print("MoviePy not installed. Cannot extract audio.")
+        return None
+        
+    try:
+        temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        temp_audio.close()
+        
+        video = VideoFileClip(str(video_path))
+        if video.audio:
+            video.audio.write_audiofile(temp_audio.name, verbose=False, logger=None)
+            video.close()
+            return Path(temp_audio.name)
+        video.close()
+    except Exception as e:
+        print(f"Audio extraction error: {e}")
+    return None
+
+def extract_interval_frames(video_path: Path, interval_sec=10):
+    """Extract frames at regular intervals (every 10 seconds)"""
+    frames = []
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened(): return []
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if fps > 0:
+            duration = total_frames / fps
+        else:
+            duration = 0
+            
+        if duration > 0:
+            # Calculate frame indices for every 'interval_sec' seconds
+            timestamps = np.arange(0, duration, interval_sec)
+            
+            for ts in timestamps:
+                frame_idx = int(ts * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if ret:
+                    is_success, buffer = cv2.imencode(".jpg", frame)
+                    if is_success:
+                        frames.append({
+                            "timestamp": ts,
+                            "data": buffer.tobytes()
+                        })
+        cap.release()
+    except Exception as e:
+        print(f"Frame extraction error: {e}")
+    return frames
+
+# ... Text extraction functions ...
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    """Extract all text from a PDF file."""
+    if not pdfplumber: return ""
     text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-    except Exception as e:
-        print(f"Error extracting text from {pdf_path}: {e}")
+                t = page.extract_text()
+                if t: text += t + "\n"
+    except: pass
     return text
 
-
-def get_image_embedding(image_path: Path) -> list[float]:
-    """Get embedding vector for an image using CLIP model."""
+def extract_text_from_docx(docx_path: Path) -> str:
+    if not Document: return ""
     try:
-        model, processor = get_clip_model()
-        
-        # Load and process image
-        image = Image.open(image_path).convert("RGB")
-        inputs = processor(images=image, return_tensors="pt")
-        
-        # Move inputs to same device as model
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Get image embedding
-        with torch.no_grad():
-            image_features = model.get_image_features(**inputs)
-            # Normalize the embedding
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            embedding = image_features[0].cpu().numpy().tolist()
-        
-        return embedding
+        doc = Document(docx_path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    except: return ""
+
+def extract_text_from_pptx(pptx_path: Path) -> str:
+    if not Presentation: return ""
+    text = []
+    try:
+        prs = Presentation(pptx_path)
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text"): text.append(shape.text)
+        return "\n".join(text)
+    except: return ""
+
+def extract_text_from_txt(txt_path: Path) -> str:
+    try: return txt_path.read_text(encoding='utf-8')
+    except: return ""
+
+def transcribe_audio(client: OpenAI, audio_path: Path) -> str:
+    try:
+        with open(audio_path, "rb") as audio_file:
+            return client.audio.transcriptions.create(model="whisper-1", file=audio_file).text
     except Exception as e:
-        print(f"Error processing image {image_path}: {e}")
-        raise
+        print(f"Transcription error: {e}")
+        return ""
 
-
-def count_tokens(text: str, encoding_name: str = "cl100k_base") -> int:
-    """Count the number of tokens in a text string."""
-    encoding = tiktoken.get_encoding(encoding_name)
-    return len(encoding.encode(text))
-
-
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """Split text into chunks of approximately chunk_size tokens with overlap."""
+def chunk_text(text: str) -> list[str]:
     encoding = tiktoken.get_encoding("cl100k_base")
     tokens = encoding.encode(text)
-    
     chunks = []
     start = 0
-    
     while start < len(tokens):
-        end = start + chunk_size
-        chunk_tokens = tokens[start:end]
-        chunk_text = encoding.decode(chunk_tokens)
+        end = start + CHUNK_SIZE
+        chunk_text = encoding.decode(tokens[start:end])
         chunks.append(chunk_text.strip())
-        start = end - overlap
-        
-        if end >= len(tokens):
-            break
-    
-    return [c for c in chunks if c]  # Filter empty chunks
+        start = end - CHUNK_OVERLAP
+    return [c for c in chunks if c]
 
-
-def get_embedding(client: OpenAI, text: str) -> list[float]:
-    """Get embedding vector for text using OpenAI API."""
-    try:
-        response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=text
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        # Provide more helpful error messages
-        error_msg = str(e)
-        if "401" in error_msg or "invalid_api_key" in error_msg.lower():
-            raise ValueError(
-                "Invalid or expired OpenAI API key. "
-                "Please check your API key in the .env file. "
-                "You can get a new key at https://platform.openai.com/account/api-keys"
-            ) from e
-        elif "429" in error_msg or "rate_limit" in error_msg.lower():
-            raise ValueError(
-                "OpenAI API rate limit exceeded. Please wait a moment and try again."
-            ) from e
-        else:
-            raise
-
+def get_openai_embedding(client: OpenAI, text: str) -> list[float]:
+    resp = client.embeddings.create(model=OPENAI_TEXT_EMBED_MODEL, input=text)
+    return resp.data[0].embedding
 
 def serialize_embedding(embedding: list[float]) -> bytes:
-    """Serialize embedding to bytes for SQLite storage."""
     return struct.pack(f"{len(embedding)}f", *embedding)
 
-
 def init_database(db_path: Path) -> sqlite3.Connection:
-    """Initialize SQLite database with VSS extension."""
-    # Remove existing database
-    if db_path.exists():
-        db_path.unlink()
-    
+    if db_path.exists(): db_path.unlink()
     conn = sqlite3.connect(str(db_path))
     conn.enable_load_extension(True)
-    
-    # Load VSS extension
     try:
         conn.load_extension("vss0")
         conn.load_extension("vector0")
-    except Exception as e:
-        print(f"Note: VSS extension loading: {e}")
-        print("Continuing with standard SQLite (vector search will use brute force)")
-    
+    except: pass
     conn.enable_load_extension(False)
     
-    # Create documents table with content_type field
     conn.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -223,199 +273,149 @@ def init_database(db_path: Path) -> sqlite3.Connection:
             content_type TEXT NOT NULL,
             chunk_text TEXT NOT NULL,
             embedding BLOB NOT NULL,
-            embedding_dimensions INTEGER NOT NULL
+            embedding_dimensions INTEGER NOT NULL,
+            metadata TEXT
         )
     """)
     
-    # Try to create VSS virtual tables for both text and images
     try:
-        # VSS table for text embeddings (OpenAI - 3072 dimensions)
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS vss_documents_text USING vss0(
-                embedding({EMBEDDING_DIMENSIONS})
-            )
-        """)
-        # VSS table for image embeddings (CLIP - 512 dimensions)
-        conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS vss_documents_image USING vss0(
-                embedding({CLIP_EMBEDDING_DIMENSIONS})
-            )
-        """)
-    except Exception as e:
-        print(f"VSS virtual table not created: {e}")
+        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_text USING vss0(embedding({TEXT_EMBED_DIM}))")
+        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_image USING vss0(embedding({IMAGE_EMBED_DIM}))")
+        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_audio USING vss0(embedding({AUDIO_EMBED_DIM}))")
+    except: pass
     
     conn.commit()
     return conn
 
-
-def insert_document(
-    conn: sqlite3.Connection, 
-    file_name: str, 
-    content_type: str,
-    chunk_text: str, 
-    embedding: list[float],
-    embedding_dimensions: int
-) -> int:
-    """Insert a document chunk into the database."""
-    embedding_bytes = serialize_embedding(embedding)
+def insert_document(conn, file_name, content_type, chunk_text, embedding, dims, metadata=None):
+    if not embedding or not isinstance(embedding, list): return
     
+    embedding_bytes = serialize_embedding(embedding)
     cursor = conn.execute(
-        "INSERT INTO documents (file_name, content_type, chunk_text, embedding, embedding_dimensions) VALUES (?, ?, ?, ?, ?)",
-        (file_name, content_type, chunk_text, embedding_bytes, embedding_dimensions)
+        "INSERT INTO documents (file_name, content_type, chunk_text, embedding, embedding_dimensions, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+        (file_name, content_type, chunk_text, embedding_bytes, dims, metadata)
     )
     doc_id = cursor.lastrowid
     
-    # Try to insert into appropriate VSS index based on content type
     try:
-        if content_type == "text":
-            conn.execute(
-                "INSERT INTO vss_documents_text (rowid, embedding) VALUES (?, ?)",
-                (doc_id, embedding_bytes)
-            )
-        elif content_type == "image":
-            conn.execute(
-                "INSERT INTO vss_documents_image (rowid, embedding) VALUES (?, ?)",
-                (doc_id, embedding_bytes)
-            )
-    except Exception:
-        pass  # VSS not available
-    
+        table = "vss_text"
+        if content_type == "image": table = "vss_image"
+        elif content_type == "audio": table = "vss_audio"
+        
+        conn.execute(f"INSERT INTO {table} (rowid, embedding) VALUES (?, ?)", (doc_id, embedding_bytes))
+    except: pass
     return doc_id
 
-
 def build_index():
-    """Build the complete index from all PDFs and images in input directory."""
-    print(f"Building index from PDFs and images in {INPUT_DIR}")
-    
-    # Validate API key before starting
-    try:
-        client = get_openai_client()
-        # Test the API key with a simple request
-        print("Validating API key...")
-        test_response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input="test"
-        )
-        print("✓ API key is valid")
-    except Exception as e:
-        print(f"\n❌ API key validation failed: {e}")
-        print("\nPlease check:")
-        print("  1. Your OPENAI_API_KEY in the root .env file")
-        print("  2. The API key is valid and not expired")
-        print("  3. You have sufficient credits in your OpenAI account")
-        print("\nGet a new API key at: https://platform.openai.com/account/api-keys")
-        raise
-    
-    # Initialize CLIP model
-    print("Initializing CLIP model...")
-    get_clip_model()
-    print("✓ CLIP model ready")
-    
-    # Get all PDF and image files
-    pdf_files = list(INPUT_DIR.glob("*.pdf"))
-    image_files = [f for f in INPUT_DIR.iterdir() 
-                   if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
-    
-    if not pdf_files and not image_files:
-        print("No PDF or image files found in input directory")
-        return
-    
-    print(f"Found {len(pdf_files)} PDF files and {len(image_files)} image files")
-    
-    # Initialize database
+    print(f"Building cloud-first index from {INPUT_DIR}")
+    client = get_openai_client()
     conn = init_database(DB_PATH)
-    
     total_chunks = 0
     
-    # Process PDF files
-    for pdf_path in pdf_files:
-        print(f"\nProcessing PDF: {pdf_path.name}")
+    for file_path in INPUT_DIR.iterdir():
+        if not file_path.is_file(): continue
+        ext = file_path.suffix.lower()
+        print(f"\nProcessing {file_path.name}")
         
-        # Extract text
-        text = extract_text_from_pdf(pdf_path)
-        if not text.strip():
-            print(f"  No text extracted from {pdf_path.name}")
-            continue
-        
-        # Chunk text
-        chunks = chunk_text(text)
-        print(f"  Created {len(chunks)} chunks")
-        
-        # Embed and store each chunk
-        for i, chunk in enumerate(chunks):
-            try:
-                embedding = get_embedding(client, chunk)
-                insert_document(
-                    conn, 
-                    pdf_path.name, 
-                    "text",
-                    chunk, 
-                    embedding,
-                    EMBEDDING_DIMENSIONS
-                )
+        # 1. Text Documents
+        if ext in DOC_EXTENSIONS:
+            text = ""
+            if ext == ".pdf": text = extract_text_from_pdf(file_path)
+            elif ext == ".docx": text = extract_text_from_docx(file_path)
+            elif ext == ".pptx": text = extract_text_from_pptx(file_path)
+            else: text = extract_text_from_txt(file_path)
+            
+            if text.strip():
+                chunks = chunk_text(text)
+                print(f"  Indexing {len(chunks)} text chunks...")
+                for i, chunk in enumerate(chunks):
+                    emb = get_openai_embedding(client, chunk)
+                    meta = f"chunk_index:{i}"
+                    insert_document(conn, file_path.name, "text", chunk, emb, TEXT_EMBED_DIM, meta)
+                    total_chunks += 1
+
+        # 2. Images
+        elif ext in IMAGE_EXTENSIONS:
+            print("  Generating cloud CLIP embedding...")
+            emb = get_hf_image_embedding(image_path=file_path)
+            if emb:
+                insert_document(conn, file_path.name, "image", f"Image: {file_path.name}", emb, IMAGE_EMBED_DIM)
                 total_chunks += 1
-                print(f"  Indexed chunk {i + 1}/{len(chunks)}", end="\r")
-            except ValueError as e:
-                # API key or configuration errors - stop processing
-                print(f"\n  ❌ Fatal error: {e}")
-                print(f"  Stopping indexing. Please fix the issue and try again.")
-                conn.close()
-                raise
-            except Exception as e:
-                # Other errors - log and continue
-                error_type = type(e).__name__
-                error_msg = str(e)
-                if "401" in error_msg:
-                    print(f"\n  ❌ API key error on chunk {i}: Invalid API key")
-                    print(f"  Please check your OPENAI_API_KEY in the root .env file")
-                    conn.close()
-                    raise ValueError("Invalid API key - stopping indexing") from e
+        
+        # 3. Audio / Video
+        elif ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS:
+            # Determine audio source path (original file or extracted temp file)
+            audio_source_path = file_path
+            temp_audio_path = None
+            
+            # If Video, extract audio first for CLAP/Whisper
+            if ext in VIDEO_EXTENSIONS:
+                print("  Extracting audio track from video...")
+                temp_audio_path = extract_audio_from_video(file_path)
+                if temp_audio_path:
+                    audio_source_path = temp_audio_path
                 else:
-                    print(f"  ⚠️  Error embedding chunk {i}: {error_type}: {error_msg}")
-        
-        print(f"  Completed {pdf_path.name}")
-    
-    # Process image files
-    for image_path in image_files:
-        print(f"\nProcessing image: {image_path.name}")
-        
-        try:
-            embedding = get_image_embedding(image_path)
-            # Store image with a placeholder text (filename)
-            chunk_text = f"Image: {image_path.name}"
-            insert_document(
-                conn,
-                image_path.name,
-                "image",
-                chunk_text,
-                embedding,
-                CLIP_EMBEDDING_DIMENSIONS
-            )
-            total_chunks += 1
-            print(f"  ✓ Indexed {image_path.name}")
-        except Exception as e:
-            error_type = type(e).__name__
-            error_msg = str(e)
-            print(f"  ⚠️  Error processing image {image_path.name}: {error_type}: {error_msg}")
-    
+                    print("  ⚠️ Could not extract audio from video. Skipping audio analysis.")
+                    audio_source_path = None
+
+            if audio_source_path:
+                # A. Transcribe (Text)
+                print("  Transcribing...")
+                transcript = transcribe_audio(client, audio_source_path)
+                if transcript.strip():
+                    chunks = chunk_text(transcript)
+                    for i, chunk in enumerate(chunks):
+                        emb = get_openai_embedding(client, chunk)
+                        meta = f"chunk_index:{i}"
+                        insert_document(conn, file_path.name, "text", f"[Transcript] {chunk}", emb, TEXT_EMBED_DIM, meta)
+                        total_chunks += 1
+                
+                # B. Audio Embedding (CLAP) - for "sound search"
+                print("  Generating cloud Audio embedding (CLAP)...")
+                emb = get_hf_audio_embedding(audio_source_path)
+                if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
+                    emb = emb[0]
+                
+                if emb and isinstance(emb, list):
+                    insert_document(conn, file_path.name, "audio", f"Audio File: {file_path.name}", emb, AUDIO_EMBED_DIM)
+                    total_chunks += 1
+                
+                # Cleanup temp file if created
+                if temp_audio_path and temp_audio_path.exists():
+                    try:
+                        os.unlink(temp_audio_path)
+                    except: pass
+            
+            # C. Video Visual Frames (CLIP) - Only for video
+            if ext in VIDEO_EXTENSIONS:
+                print("  Extracting visual frames (every 10s)...")
+                frames = extract_interval_frames(file_path, interval_sec=10)
+                
+                print(f"  Generated {len(frames)} frames. Indexing...")
+                for i, frame in enumerate(frames):
+                    ts = frame['timestamp']
+                    # Embed
+                    emb = get_hf_image_embedding(image_data=frame['data'])
+                    if emb:
+                        # Store metadata: "timestamp:10.5"
+                        meta = f"timestamp:{ts:.1f}"
+                        # Descriptive text for LLM
+                        chunk_text = f"Video Frame: {file_path.name} at {ts:.1f} seconds"
+                        
+                        insert_document(conn, file_path.name, "image", chunk_text, emb, IMAGE_EMBED_DIM, meta)
+                        print(f"    Indexed frame at {ts:.1f}s")
+                        total_chunks += 1
+
     conn.commit()
     conn.close()
-    
-    print(f"\n\nIndexing complete!")
-    print(f"Total chunks indexed: {total_chunks}")
-    print(f"Database saved to: {DB_PATH}")
-
+    print(f"\nIndexing complete! Total chunks: {total_chunks}")
 
 def main():
-    parser = argparse.ArgumentParser(description="IndexChat PDF Indexer")
-    parser.add_argument("--build", action="store_true", help="Build index from all PDFs")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--build", action="store_true", help="Build index")
     args = parser.parse_args()
-    
-    if args.build:
-        build_index()
-    else:
-        parser.print_help()
-
+    if args.build: build_index()
+    else: parser.print_help()
 
 if __name__ == "__main__":
     main()

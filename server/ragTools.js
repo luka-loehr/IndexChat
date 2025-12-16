@@ -2,7 +2,8 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { execSync } from "child_process";
+import fetch from "node-fetch"; // Node.js 18+ has global fetch, but if not we might need it.
+                               // Actually let's assume global fetch is available or use 'undici'
 import openai from "./openaiClient.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -10,12 +11,18 @@ const __dirname = path.dirname(__filename);
 
 const DB_PATH = path.join(__dirname, "..", "indexer", "database.sqlite");
 const EMBEDDING_MODEL = "text-embedding-3-large";
-const EMBEDDING_DIMENSIONS = 3072;
-const CLIP_EMBEDDING_DIMENSIONS = 512;
+const TEXT_EMBED_DIM = 3072;
+const HF_CLIP_MODEL = "openai/clip-vit-base-patch32";
+const HF_CLAP_MODEL = "laion/clap-htsat-unfused";
+const CLIP_DIM = 512;
+const CLAP_DIM = 512;
 
-/**
- * Get embedding vector for a query string using OpenAI
- */
+// Polyfill check for fetch
+if (!global.fetch) {
+  // If running in older node, we'd need to install it. 
+  // Assuming Node 18+ environment provided by cursor usually.
+}
+
 async function getQueryEmbedding(query) {
   const response = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
@@ -24,27 +31,58 @@ async function getQueryEmbedding(query) {
   return response.data[0].embedding;
 }
 
-/**
- * Get CLIP text embedding for image search
- */
-function getClipTextEmbedding(query) {
+// Helper to query HF API
+async function queryHfApi(modelId, data) {
+  const token = process.env.HUGGINGFACE_API_KEY;
+  if (!token) return null;
+  
+  const response = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) return null;
+  return await response.json();
+}
+
+async function getClipTextEmbedding(query) {
+  // For CLIP text embedding via HF, strictly speaking we need the 'feature-extraction' of the text
+  // passed through the CLIP text encoder.
+  // HF 'feature-extraction' pipeline usually does this if you send text.
+  // We send { inputs: "string" }
   try {
-    const scriptPath = path.join(__dirname, "..", "indexer", "clip_embed.py");
-    const result = execSync(
-      `python3 "${scriptPath}" "${query.replace(/"/g, '\\"')}"`,
-      { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }
-    );
-    const embedding = JSON.parse(result.trim());
-    return embedding;
-  } catch (error) {
-    console.error("Error getting CLIP embedding:", error);
+    const res = await queryHfApi(HF_CLIP_MODEL, { inputs: query });
+    // Result can be [embedding] or [[embedding]]
+    if (Array.isArray(res)) {
+      if (Array.isArray(res[0])) return res[0]; // Batched
+      return res; // Single
+    }
+    return null;
+  } catch (e) {
+    console.error("CLIP Embed Error:", e);
     return null;
   }
 }
 
-/**
- * Deserialize embedding from SQLite BLOB
- */
+async function getClapTextEmbedding(query) {
+  // CLAP text embedding
+  try {
+    const res = await queryHfApi(HF_CLAP_MODEL, { inputs: query });
+    if (Array.isArray(res)) {
+      if (Array.isArray(res[0])) return res[0];
+      return res;
+    }
+    return null;
+  } catch (e) {
+    console.error("CLAP Embed Error:", e);
+    return null;
+  }
+}
+
 function deserializeEmbedding(buffer) {
   const floats = [];
   for (let i = 0; i < buffer.length; i += 4) {
@@ -53,235 +91,138 @@ function deserializeEmbedding(buffer) {
   return floats;
 }
 
-/**
- * Calculate cosine similarity between two vectors
- */
 function cosineSimilarity(vecA, vecB) {
   let dotProduct = 0;
   let normA = 0;
   let normB = 0;
-
   for (let i = 0; i < vecA.length; i++) {
     dotProduct += vecA[i] * vecB[i];
     normA += vecA[i] * vecA[i];
     normB += vecB[i] * vecB[i];
   }
-
   if (normA === 0 || normB === 0) return 0;
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-/**
- * Search documents (PDFs and images) using vector similarity
- * @param {string} query - The search query
- * @param {number} topK - Number of results to return
- * @returns {Array} Array of matching chunks with file_name, id, chunk_text, and content_type
- */
-export async function searchPdfs(query, topK = 5) {
-  // Check if database exists
-  if (!fs.existsSync(DB_PATH)) {
-    return [];
+// Generic search function for a specific table/embedding
+function searchTable(db, tableName, queryEmbedding, type, topK, dim) {
+  if (!queryEmbedding) return [];
+  
+  let results = [];
+  const buffer = Buffer.alloc(dim * 4);
+  for (let i = 0; i < queryEmbedding.length; i++) {
+    buffer.writeFloatLE(queryEmbedding[i], i * 4);
   }
 
-  const db = new Database(DB_PATH, { readonly: true });
-  const allResults = [];
-
+  // Try VSS
   try {
-    // Search text documents (PDFs) using OpenAI embeddings
-    const textQueryEmbedding = await getQueryEmbedding(query);
-    let textResults = [];
-
-    try {
-      // Try VSS search for text
-      const embeddingBuffer = Buffer.alloc(EMBEDDING_DIMENSIONS * 4);
-      for (let i = 0; i < textQueryEmbedding.length; i++) {
-        embeddingBuffer.writeFloatLE(textQueryEmbedding[i], i * 4);
-      }
-
-      const vssTextResults = db
-        .prepare(
-          `
-        SELECT 
-          d.id,
-          d.file_name,
-          d.content_type,
-          d.chunk_text,
-          vss_documents_text.distance
-        FROM vss_documents_text
-        JOIN documents d ON d.id = vss_documents_text.rowid
-        WHERE d.content_type = 'text' AND vss_search(vss_documents_text.embedding, ?)
-        LIMIT ?
-      `
-        )
-        .all(embeddingBuffer, topK);
-
-      if (vssTextResults.length > 0) {
-        textResults = vssTextResults.map((row) => ({
-          id: row.id,
-          file_name: row.file_name,
-          content_type: row.content_type || "text",
-          chunk_text: row.chunk_text,
-        }));
-      }
-    } catch (vssError) {
-      // VSS not available, fall back to brute force
-    }
-
-    // Fall back to brute force for text if VSS didn't work
-    if (textResults.length === 0) {
-      const allTextDocs = db
-        .prepare(
-          "SELECT id, file_name, content_type, chunk_text, embedding FROM documents WHERE content_type = 'text'"
-        )
-        .all();
-
-      const similarities = allTextDocs.map((doc) => {
-        const docEmbedding = deserializeEmbedding(doc.embedding);
-        const similarity = cosineSimilarity(textQueryEmbedding, docEmbedding);
-        return {
-          id: doc.id,
-          file_name: doc.file_name,
-          content_type: doc.content_type || "text",
-          chunk_text: doc.chunk_text,
-          similarity,
-        };
-      });
-
-      similarities.sort((a, b) => b.similarity - a.similarity);
-      textResults = similarities.slice(0, topK).map((doc) => ({
-        id: doc.id,
-        file_name: doc.file_name,
-        content_type: doc.content_type || "text",
-        chunk_text: doc.chunk_text,
+    // Determine VSS table name
+    const vssTable = `vss_${type}`; // vss_text, vss_image, vss_audio
+    
+    // Check if table exists (quick check via select or try/catch)
+    const vssResults = db.prepare(`
+      SELECT 
+        d.id, d.file_name, d.content_type, d.chunk_text, d.metadata, v.distance
+      FROM ${vssTable} v
+      JOIN documents d ON d.id = v.rowid
+      WHERE vss_search(v.embedding, ?)
+      LIMIT ?
+    `).all(buffer, topK);
+    
+    if (vssResults.length > 0) {
+      return vssResults.map(r => ({
+        id: r.id,
+        file_name: r.file_name,
+        content_type: r.content_type || type,
+        chunk_text: r.chunk_text,
+        metadata: r.metadata,
+        // Convert distance to similarity or just pass it
+        // VSS returns L2 distance usually? Or Inner Product? Depends on config. 
+        // Assuming relevance.
       }));
     }
+  } catch (e) {
+    // console.log(`VSS search failed for ${type}: ${e.message}`);
+  }
 
-    allResults.push(...textResults);
+  // Fallback Brute Force
+  const docs = db.prepare(`SELECT id, file_name, content_type, chunk_text, embedding, metadata FROM documents WHERE content_type = ?`).all(type);
+  const sims = docs.map(doc => {
+    const emb = deserializeEmbedding(doc.embedding);
+    // Safety check dim
+    if (emb.length !== dim) return null;
+    return {
+      id: doc.id,
+      file_name: doc.file_name,
+      content_type: doc.content_type,
+      chunk_text: doc.chunk_text,
+      metadata: doc.metadata,
+      similarity: cosineSimilarity(queryEmbedding, emb)
+    };
+  }).filter(r => r !== null);
+  
+  sims.sort((a, b) => b.similarity - a.similarity);
+  return sims.slice(0, topK);
+}
 
-    // Search images using CLIP embeddings
-    const clipQueryEmbedding = getClipTextEmbedding(query);
-    if (clipQueryEmbedding) {
-      let imageResults = [];
+export async function searchPdfs(query, topK = 5) {
+  if (!fs.existsSync(DB_PATH)) return [];
+  const db = new Database(DB_PATH, { readonly: true });
+  
+  try {
+    const allResults = [];
 
-      try {
-        // Try VSS search for images
-        const clipEmbeddingBuffer = Buffer.alloc(CLIP_EMBEDDING_DIMENSIONS * 4);
-        for (let i = 0; i < clipQueryEmbedding.length; i++) {
-          clipEmbeddingBuffer.writeFloatLE(clipQueryEmbedding[i], i * 4);
-        }
+    // 1. Text Search
+    const textEmb = await getQueryEmbedding(query);
+    const textRes = searchTable(db, "documents", textEmb, "text", topK, TEXT_EMBED_DIM);
+    allResults.push(...textRes);
 
-        const vssImageResults = db
-          .prepare(
-            `
-          SELECT 
-            d.id,
-            d.file_name,
-            d.content_type,
-            d.chunk_text,
-            vss_documents_image.distance
-          FROM vss_documents_image
-          JOIN documents d ON d.id = vss_documents_image.rowid
-          WHERE d.content_type = 'image' AND vss_search(vss_documents_image.embedding, ?)
-          LIMIT ?
-        `
-          )
-          .all(clipEmbeddingBuffer, topK);
-
-        if (vssImageResults.length > 0) {
-          imageResults = vssImageResults.map((row) => ({
-            id: row.id,
-            file_name: row.file_name,
-            content_type: row.content_type || "image",
-            chunk_text: row.chunk_text,
-          }));
-        }
-      } catch (vssError) {
-        // VSS not available, fall back to brute force
-      }
-
-      // Fall back to brute force for images if VSS didn't work
-      if (imageResults.length === 0) {
-        const allImageDocs = db
-          .prepare(
-            "SELECT id, file_name, content_type, chunk_text, embedding FROM documents WHERE content_type = 'image'"
-          )
-          .all();
-
-        const similarities = allImageDocs.map((doc) => {
-          const docEmbedding = deserializeEmbedding(doc.embedding);
-          const similarity = cosineSimilarity(clipQueryEmbedding, docEmbedding);
-          return {
-            id: doc.id,
-            file_name: doc.file_name,
-            content_type: doc.content_type || "image",
-            chunk_text: doc.chunk_text,
-            similarity,
-          };
-        });
-
-        similarities.sort((a, b) => b.similarity - a.similarity);
-        imageResults = similarities.slice(0, topK).map((doc) => ({
-          id: doc.id,
-          file_name: doc.file_name,
-          content_type: doc.content_type || "image",
-          chunk_text: doc.chunk_text,
-        }));
-      }
-
-      allResults.push(...imageResults);
+    // 2. Image Search (CLIP)
+    const clipEmb = await getClipTextEmbedding(query);
+    if (clipEmb) {
+      const imgRes = searchTable(db, "documents", clipEmb, "image", topK, CLIP_DIM);
+      allResults.push(...imgRes);
     }
 
-    // Sort all results and return top K (mix of text and images)
-    // For now, just return all results up to topK
-    return allResults.slice(0, topK);
+    // 3. Audio Search (CLAP)
+    const clapEmb = await getClapTextEmbedding(query);
+    if (clapEmb) {
+      const audioRes = searchTable(db, "documents", clapEmb, "audio", topK, CLAP_DIM);
+      allResults.push(...audioRes);
+    }
+
+    // Sort by relevance (if we had unified scoring, for now we mix)
+    // Actually we should probably just return them all and let LLM sort it out
+    // or limit the total size.
+    return allResults.slice(0, topK * 3); 
   } finally {
     db.close();
   }
 }
 
-/**
- * Get list of all indexed files
- * @returns {Array} Array of unique file names
- */
 export function getIndexedFiles() {
-  // Return empty array if database doesn't exist yet
-  if (!fs.existsSync(DB_PATH)) {
-    return [];
-  }
-
+  if (!fs.existsSync(DB_PATH)) return [];
   const db = new Database(DB_PATH, { readonly: true });
   try {
-    const files = db
-      .prepare("SELECT DISTINCT file_name FROM documents ORDER BY file_name")
-      .all();
-    return files.map((f) => f.file_name);
+    const files = db.prepare("SELECT DISTINCT file_name FROM documents ORDER BY file_name").all();
+    return files.map(f => f.file_name);
   } finally {
     db.close();
   }
 }
 
-/**
- * Tool definition for OpenAI function calling
- */
 export const searchPdfsTool = {
   type: "function",
   function: {
     name: "search_pdfs",
-    description:
-      "Searches the indexed PDF documents and images using vector similarity and returns relevant text chunks and images along with their source file names. Use this to find information from the user's PDF documents and images.",
+    description: "Searches indexed documents (text, image, audio) using vector similarity.",
     parameters: {
       type: "object",
       properties: {
-        query: {
-          type: "string",
-          description: "The search query to find relevant document chunks and images",
-        },
-        top_k: {
-          type: "number",
-          description: "Number of top results to return (default: 5)",
-        },
+        query: { type: "string", description: "Search query" },
+        top_k: { type: "number", description: "Results count" }
       },
-      required: ["query"],
-    },
-  },
+      required: ["query"]
+    }
+  }
 };
