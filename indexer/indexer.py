@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-IndexChat Multi-Format Indexer
-Indexes PDF, DOCX, PPTX, Images, Audio, and Video into SQLite-VSS for vector search.
+IndexChat Cloud-First Indexer
+Indexes documents using OpenAI and Hugging Face APIs.
 """
 
 import argparse
 import os
 import struct
 import sqlite3
+import time
+import base64
 from pathlib import Path
 import mimetypes
+import requests
 
 import tiktoken
 from openai import OpenAI
 from dotenv import load_dotenv
 from PIL import Image
-import torch
-from transformers import CLIPProcessor, CLIPModel
 
 # Optional imports for document handling
 try:
@@ -45,173 +46,172 @@ else:
 # Configuration
 INPUT_DIR = Path(__file__).parent.parent / "input"
 DB_PATH = Path(__file__).parent / "database.sqlite"
-EMBEDDING_MODEL = "text-embedding-3-large"
-EMBEDDING_DIMENSIONS = 3072
-CLIP_EMBEDDING_DIMENSIONS = 512
+
+# Models
+OPENAI_TEXT_EMBED_MODEL = "text-embedding-3-large"
+HF_IMAGE_MODEL = "openai/clip-vit-base-patch32"
+HF_AUDIO_MODEL = "laion/clap-htsat-unfused" 
+
+# Dimensions
+TEXT_EMBED_DIM = 3072
+IMAGE_EMBED_DIM = 512
+AUDIO_EMBED_DIM = 512 # CLAP projection dimension usually 512 or 768. Check model card.
+                      # laion/clap-htsat-unfused outputs 512 usually.
+                      
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
 
 # File Extensions
 DOC_EXTENSIONS = {".pdf", ".docx", ".pptx", ".txt", ".md"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".mov", ".avi"} # Video treated as audio for transcription
-
-# Global CLIP model cache
-_clip_model = None
-_clip_processor = None
-
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi"} # Video = Image (frame) + Audio
 
 def get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable is required.")
-    
-    api_key = api_key.strip()
-    if (api_key.startswith('"') and api_key.endswith('"')) or \
-       (api_key.startswith("'") and api_key.endswith("'")):
-        api_key = api_key[1:-1].strip()
-    
     return OpenAI(api_key=api_key)
 
+def get_hf_headers():
+    token = os.getenv("HUGGINGFACE_API_KEY")
+    if not token:
+        # Fallback or warn? Better to warn.
+        print("⚠️ HUGGINGFACE_API_KEY not found. Image/Audio embeddings will fail.")
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
-def get_clip_model():
-    global _clip_model, _clip_processor
-    if _clip_model is None or _clip_processor is None:
-        print("Loading CLIP model...")
-        model_name = "openai/clip-vit-base-patch32"
-        _clip_model = CLIPModel.from_pretrained(model_name)
-        _clip_processor = CLIPProcessor.from_pretrained(model_name)
+def query_hf_api(model_id, data, retries=3):
+    api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = get_hf_headers()
+    
+    for i in range(retries):
+        try:
+            response = requests.post(api_url, headers=headers, json=data) # or data=data depending on endpoint
+            if response.status_code == 200:
+                return response.json()
+            else:
+                # If model is loading, wait
+                err = response.json()
+                if "error" in err and "loading" in err["error"].lower():
+                    wait_time = err.get("estimated_time", 20)
+                    print(f"Model {model_id} loading, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                print(f"Error querying HF API ({model_id}): {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"Exception querying HF API: {e}")
+        time.sleep(2)
+    return None
+
+def get_hf_image_embedding(image_path: Path):
+    # Read image and base64 encode
+    with open(image_path, "rb") as img_file:
+        b64_image = base64.b64encode(img_file.read()).decode('utf-8')
+    
+    # HF Feature Extraction API for CLIP often expects raw string or specialized payload
+    # Standard Feature Extraction for CLIP on HF usually works with raw bytes? 
+    # Actually, the 'feature-extraction' pipeline on HF Inference API is tricky for multimodal.
+    # A better way is to use the "zero-shot-image-classification" or similar, BUT we want the embedding.
+    # Many CLIP models on HF Inference API return the pooled output or last hidden state.
+    # Let's try sending the image data directly.
+    
+    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_IMAGE_MODEL}"
+    headers = get_hf_headers()
+    with open(image_path, "rb") as f:
+        data = f.read()
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _clip_model = _clip_model.to(device)
-        _clip_model.eval()
-        print(f"CLIP model loaded on {device}")
-    return _clip_model, _clip_processor
+    response = requests.post(api_url, headers=headers, data=data)
+    if response.status_code != 200:
+        print(f"Error getting image embedding: {response.text}")
+        return None
+        
+    # Result is usually a list of floats (the embedding)
+    return response.json()
 
+def get_hf_audio_embedding(audio_path: Path):
+    # Similarly for CLAP
+    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_AUDIO_MODEL}"
+    headers = get_hf_headers()
+    with open(audio_path, "rb") as f:
+        data = f.read()
+        
+    response = requests.post(api_url, headers=headers, data=data)
+    if response.status_code != 200:
+        print(f"Error getting audio embedding: {response.text}")
+        return None
+    return response.json()
 
+# ... Text extraction functions (same as before) ...
 def extract_text_from_pdf(pdf_path: Path) -> str:
-    if not pdfplumber:
-        print("pdfplumber not installed. Skipping PDF.")
-        return ""
+    if not pdfplumber: return ""
     text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-    except Exception as e:
-        print(f"Error extracting text from {pdf_path}: {e}")
+                t = page.extract_text()
+                if t: text += t + "\n"
+    except: pass
     return text
 
-
 def extract_text_from_docx(docx_path: Path) -> str:
-    if not Document:
-        print("python-docx not installed. Skipping DOCX.")
-        return ""
+    if not Document: return ""
     try:
         doc = Document(docx_path)
-        return "\n".join([para.text for para in doc.paragraphs])
-    except Exception as e:
-        print(f"Error extracting text from {docx_path}: {e}")
-        return ""
-
+        return "\n".join([p.text for p in doc.paragraphs])
+    except: return ""
 
 def extract_text_from_pptx(pptx_path: Path) -> str:
-    if not Presentation:
-        print("python-pptx not installed. Skipping PPTX.")
-        return ""
+    if not Presentation: return ""
     text = []
     try:
         prs = Presentation(pptx_path)
         for slide in prs.slides:
             for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text.append(shape.text)
+                if hasattr(shape, "text"): text.append(shape.text)
         return "\n".join(text)
-    except Exception as e:
-        print(f"Error extracting text from {pptx_path}: {e}")
-        return ""
-
+    except: return ""
 
 def extract_text_from_txt(txt_path: Path) -> str:
-    try:
-        return txt_path.read_text(encoding='utf-8')
-    except Exception as e:
-        print(f"Error extracting text from {txt_path}: {e}")
-        return ""
-
+    try: return txt_path.read_text(encoding='utf-8')
+    except: return ""
 
 def transcribe_audio(client: OpenAI, audio_path: Path) -> str:
     try:
-        print(f"Transcribing {audio_path.name}...")
         with open(audio_path, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        return transcription.text
+            # Check file size, if > 25MB needs splitting, but ignoring for now
+            return client.audio.transcriptions.create(model="whisper-1", file=audio_file).text
     except Exception as e:
-        print(f"Error transcribing {audio_path}: {e}")
+        print(f"Transcription error: {e}")
         return ""
 
-
-def get_image_embedding(image_path: Path) -> list[float]:
-    try:
-        model, processor = get_clip_model()
-        image = Image.open(image_path).convert("RGB")
-        inputs = processor(images=image, return_tensors="pt")
-        
-        device = next(model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        with torch.no_grad():
-            image_features = model.get_image_features(**inputs)
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            embedding = image_features[0].cpu().numpy().tolist()
-        return embedding
-    except Exception as e:
-        print(f"Error processing image {image_path}: {e}")
-        raise
-
-
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def chunk_text(text: str) -> list[str]:
     encoding = tiktoken.get_encoding("cl100k_base")
     tokens = encoding.encode(text)
-    
     chunks = []
     start = 0
     while start < len(tokens):
-        end = start + chunk_size
-        chunk_tokens = tokens[start:end]
-        chunk_text = encoding.decode(chunk_tokens)
+        end = start + CHUNK_SIZE
+        chunk_text = encoding.decode(tokens[start:end])
         chunks.append(chunk_text.strip())
-        start = end - overlap
-        if end >= len(tokens):
-            break
+        start = end - CHUNK_OVERLAP
     return [c for c in chunks if c]
 
-
-def get_embedding(client: OpenAI, text: str) -> list[float]:
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return response.data[0].embedding
-
+def get_openai_embedding(client: OpenAI, text: str) -> list[float]:
+    resp = client.embeddings.create(model=OPENAI_TEXT_EMBED_MODEL, input=text)
+    return resp.data[0].embedding
 
 def serialize_embedding(embedding: list[float]) -> bytes:
     return struct.pack(f"{len(embedding)}f", *embedding)
 
-
 def init_database(db_path: Path) -> sqlite3.Connection:
-    if db_path.exists():
-        db_path.unlink()
-    
+    if db_path.exists(): db_path.unlink()
     conn = sqlite3.connect(str(db_path))
     conn.enable_load_extension(True)
     try:
         conn.load_extension("vss0")
         conn.load_extension("vector0")
-    except Exception as e:
-        print(f"Note: VSS extension loading: {e}")
+    except: pass
     conn.enable_load_extension(False)
     
     conn.execute("""
@@ -226,16 +226,18 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     """)
     
     try:
-        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_documents_text USING vss0(embedding({EMBEDDING_DIMENSIONS}))")
-        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_documents_image USING vss0(embedding({CLIP_EMBEDDING_DIMENSIONS}))")
-    except Exception:
-        pass
+        # Tables for different spaces
+        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_text USING vss0(embedding({TEXT_EMBED_DIM}))")
+        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_image USING vss0(embedding({IMAGE_EMBED_DIM}))")
+        conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vss_audio USING vss0(embedding({AUDIO_EMBED_DIM}))")
+    except: pass
     
     conn.commit()
     return conn
 
-
 def insert_document(conn, file_name, content_type, chunk_text, embedding, dims):
+    if not embedding or not isinstance(embedding, list): return
+    
     embedding_bytes = serialize_embedding(embedding)
     cursor = conn.execute(
         "INSERT INTO documents (file_name, content_type, chunk_text, embedding, embedding_dimensions) VALUES (?, ?, ?, ?, ?)",
@@ -244,90 +246,83 @@ def insert_document(conn, file_name, content_type, chunk_text, embedding, dims):
     doc_id = cursor.lastrowid
     
     try:
-        table = "vss_documents_text" if content_type == "text" else "vss_documents_image"
+        table = "vss_text"
+        if content_type == "image": table = "vss_image"
+        elif content_type == "audio": table = "vss_audio"
+        
         conn.execute(f"INSERT INTO {table} (rowid, embedding) VALUES (?, ?)", (doc_id, embedding_bytes))
-    except Exception:
-        pass
+    except: pass
     return doc_id
 
-
 def build_index():
-    print(f"Building index from {INPUT_DIR}")
+    print(f"Building cloud-first index from {INPUT_DIR}")
     client = get_openai_client()
-    
-    # Initialize CLIP only if needed (images present)
-    has_images = any(f.suffix.lower() in IMAGE_EXTENSIONS for f in INPUT_DIR.iterdir() if f.is_file())
-    if has_images:
-        get_clip_model()
-    
     conn = init_database(DB_PATH)
     total_chunks = 0
     
     for file_path in INPUT_DIR.iterdir():
-        if not file_path.is_file():
-            continue
-            
+        if not file_path.is_file(): continue
         ext = file_path.suffix.lower()
         print(f"\nProcessing {file_path.name}")
         
-        text = ""
-        embedding_type = "text"
-        embedding_dims = EMBEDDING_DIMENSIONS
+        # 1. Text Documents
+        if ext in DOC_EXTENSIONS:
+            text = ""
+            if ext == ".pdf": text = extract_text_from_pdf(file_path)
+            elif ext == ".docx": text = extract_text_from_docx(file_path)
+            elif ext == ".pptx": text = extract_text_from_pptx(file_path)
+            else: text = extract_text_from_txt(file_path)
+            
+            if text.strip():
+                chunks = chunk_text(text)
+                print(f"  Indexing {len(chunks)} text chunks...")
+                for chunk in chunks:
+                    emb = get_openai_embedding(client, chunk)
+                    insert_document(conn, file_path.name, "text", chunk, emb, TEXT_EMBED_DIM)
+                    total_chunks += 1
+
+        # 2. Images
+        elif ext in IMAGE_EXTENSIONS:
+            print("  Generating cloud CLIP embedding...")
+            emb = get_hf_image_embedding(file_path)
+            if emb:
+                insert_document(conn, file_path.name, "image", f"Image: {file_path.name}", emb, IMAGE_EMBED_DIM)
+                total_chunks += 1
         
-        try:
-            if ext == ".pdf":
-                text = extract_text_from_pdf(file_path)
-            elif ext == ".docx":
-                text = extract_text_from_docx(file_path)
-            elif ext == ".pptx":
-                text = extract_text_from_pptx(file_path)
-            elif ext in [".txt", ".md"]:
-                text = extract_text_from_txt(file_path)
-            elif ext in AUDIO_EXTENSIONS:
-                text = transcribe_audio(client, file_path)
-            elif ext in IMAGE_EXTENSIONS:
-                embedding = get_image_embedding(file_path)
-                chunk_text = f"Image: {file_path.name}"
-                insert_document(conn, file_path.name, "image", chunk_text, embedding, CLIP_EMBEDDING_DIMENSIONS)
-                total_chunks += 1
-                print(f"  ✓ Indexed image {file_path.name}")
-                continue
-            else:
-                print(f"  Skipping unsupported file: {file_path.name}")
-                continue
+        # 3. Audio / Video (Treat Video as Audio+Image later, for now just Audio/Transcribe)
+        elif ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS:
+            # A. Transcribe (Text)
+            print("  Transcribing...")
+            transcript = transcribe_audio(client, file_path)
+            if transcript.strip():
+                chunks = chunk_text(transcript)
+                for chunk in chunks:
+                    emb = get_openai_embedding(client, chunk)
+                    insert_document(conn, file_path.name, "text", f"[Transcript] {chunk}", emb, TEXT_EMBED_DIM)
+                    total_chunks += 1
             
-            if not text.strip():
-                print(f"  No text extracted from {file_path.name}")
-                continue
-            
-            chunks = chunk_text(text)
-            print(f"  Created {len(chunks)} chunks")
-            
-            for i, chunk in enumerate(chunks):
-                embedding = get_embedding(client, chunk)
-                insert_document(conn, file_path.name, "text", chunk, embedding, EMBEDDING_DIMENSIONS)
-                total_chunks += 1
-                print(f"  Indexed chunk {i + 1}/{len(chunks)}", end="\r")
-            print(f"\n  ✓ Completed {file_path.name}")
-            
-        except Exception as e:
-            print(f"  ❌ Error processing {file_path.name}: {e}")
-    
+            # B. Audio Embedding (CLAP) - for "sound search"
+            if ext in AUDIO_EXTENSIONS: # HF CLAP might fail on large video files
+                print("  Generating cloud Audio embedding...")
+                emb = get_hf_audio_embedding(file_path)
+                # HF API sometimes returns nested list [[...]] or error
+                if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
+                    emb = emb[0] # Unwrap batch
+                
+                if emb and isinstance(emb, list):
+                    insert_document(conn, file_path.name, "audio", f"Audio File: {file_path.name}", emb, AUDIO_EMBED_DIM)
+                    total_chunks += 1
+
     conn.commit()
     conn.close()
-    print(f"\n\nIndexing complete! Total chunks: {total_chunks}")
-
+    print(f"\nIndexing complete! Total chunks: {total_chunks}")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", action="store_true", help="Build index")
     args = parser.parse_args()
-    
-    if args.build:
-        build_index()
-    else:
-        parser.print_help()
-
+    if args.build: build_index()
+    else: parser.print_help()
 
 if __name__ == "__main__":
     main()

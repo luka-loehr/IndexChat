@@ -48,6 +48,9 @@ When answering questions:
 4. If the documents don't contain relevant information, say so clearly
 5. Be concise but thorough in your answers`;
 
+// Model Selection
+const CHAT_MODEL = "gpt-4o";
+
 /**
  * Process a user query with GPT-4 tool calling
  */
@@ -62,7 +65,7 @@ async function processQuery(query) {
 
   // Initial call to GPT-4
   let response = await openai.chat.completions.create({
-    model: "gpt-4o",
+    model: CHAT_MODEL,
     messages,
     tools,
     tool_choice: "auto",
@@ -102,7 +105,7 @@ async function processQuery(query) {
           const formattedResults = results
             .map(
               (r, i) =>
-                `[${i + 1}] File: ${r.file_name} (ID: ${r.id})\n${r.chunk_text}`
+                `[${i + 1}] File: ${r.file_name} (Type: ${r.content_type || 'text'})\n${r.chunk_text}`
             )
             .join("\n\n---\n\n");
 
@@ -132,7 +135,7 @@ async function processQuery(query) {
 
     // Get next response from GPT
     response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: CHAT_MODEL,
       messages,
       tools,
       tool_choice: "auto",
