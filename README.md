@@ -1,45 +1,81 @@
 # IndexChat Workbench (Cloud Edition)
 
-A professional AI workbench for your documents, powered by Cloud APIs (OpenAI + Hugging Face).
+A professional, cloud-first AI workbench for multi-modal document analysis. It uses a "Sources Brain" approach to ingest documents, images, audio, and video, making them searchable and queryable via a modern RAG (Retrieval-Augmented Generation) pipeline.
 
-## Features
+## 🏗️ Architecture
 
--   **Cloud-First Architecture**: No heavy local models. Uses:
-    -   **OpenAI `text-embedding-3-large`** for text.
-    -   **OpenAI `gpt-4o`** for reasoning and chat.
-    -   **Hugging Face Inference API** for Multimodal Embeddings:
-        -   Image: `openai/clip-vit-base-patch32` (CLIP)
-        -   Audio: `laion/clap-htsat-unfused` (CLAP)
--   **Multi-Modal Search**:
-    -   Search text with text.
-    -   Search images with text descriptions.
-    -   Search audio with text descriptions (e.g. "sound of rain").
--   **Workbench UI**: Clean, 3-column layout for serious work.
+This project uses a **Local-First / Cloud-Powered** architecture. The heavy ML lifting is done by APIs, while the orchestration and database remain local for privacy and speed.
 
-## Setup
+### 1. **Frontend (Next.js 14)**
+*   **Workbench UI**: A 3-column professional layout (Sources Sidebar, Chat Workspace, Tools).
+*   **Visuals**: Dark mode, muted professional color palette, Lucide icons.
+*   **Interaction**: Drag-and-drop uploads, real-time chat with source citations.
 
-1.  **Install Dependencies**:
+### 2. **Backend (Node.js/Express)**
+*   **API Server**: Handles file uploads and search queries (`/ask`, `/upload`).
+*   **RAG Engine**: Performs "fan-out" vector searches across three distinct vector spaces (Text, Image, Audio) simultaneously to answer user queries.
+*   **Metadata Awareness**: Returns precise timestamps for video/audio matches.
+
+### 3. **Indexer (Python)**
+*   **Watcher**: Monitors the `input/` directory for new files.
+*   **Multi-Modal Processing**:
+    *   **📄 Documents (PDF, DOCX, PPTX)**: Text extraction -> Chunking -> **OpenAI `text-embedding-3-large`**.
+    *   **🖼️ Images**: **Hugging Face `openai/clip-vit-base-patch32`** (CLIP) embeddings.
+    *   **🎵 Audio**: 
+        *   **Speech**: Transcription via **OpenAI Whisper** -> Text Embedding.
+        *   **Acoustics**: Sound event detection via **Hugging Face `laion/clap-htsat-unfused`** (CLAP).
+    *   **🎥 Video**:
+        *   **Visuals**: Extracts frames every 10 seconds -> CLIP Embeddings (with timestamp metadata).
+        *   **Audio Track**: Extracted via `moviepy` -> processed as Audio (Speech + Acoustics).
+*   **Database**: **SQLite** with `sqlite-vss` extension for high-performance local vector search.
+
+## 🚀 Setup & Usage
+
+### Prerequisites
+*   Node.js 18+
+*   Python 3.10+
+*   **API Keys**:
+    *   **OpenAI API Key** (for Chat, Transcription, Text Embeddings)
+    *   **Hugging Face API Key** (for Image/Audio/Video embeddings)
+
+### Installation
+
+1.  **Install Dependencies** (installs both Node and Python requirements):
     ```bash
     npm install
     ```
 
 2.  **Configure Environment**:
-    Create `.env` in the root directory:
+    Create a `.env` file in the root directory:
     ```env
     OPENAI_API_KEY=sk-proj-...
-    HUGGINGFACE_API_KEY=hf_...  # Required for Image/Audio indexing
+    HUGGINGFACE_API_KEY=hf_...
     ```
 
-3.  **Run**:
+3.  **Start the Workbench**:
     ```bash
     npm run dev
     ```
+    *   **Frontend**: http://localhost:3000
+    *   **Backend**: http://localhost:3001
 
-## Usage
+### Supported File Types
 
--   **Add Sources**: Drag files into the UI or `input/` folder.
--   **Supported Formats**: PDF, DOCX, PPTX, TXT, JPG, PNG, MP3, WAV, MP4.
--   **Search**: Type "Find documents about X" or "Find images of a cat" or "Find audio of applause".
+| Type | Formats | How it's Indexed |
+| :--- | :--- | :--- |
+| **Documents** | PDF, DOCX, PPTX, TXT, MD | Text Search |
+| **Images** | JPG, PNG, WEBP | Visual Description Search (CLIP) |
+| **Audio** | MP3, WAV, M4A | Speech (Whisper) + Sound Events (CLAP) |
+| **Video** | MP4, MOV, AVI | Visual Frames (every 10s) + Speech + Sound Events |
 
-## Note on Video
-Videos are treated as Audio (Transcription + CLAP embedding). Visual frame extraction is currently simplified to filename-based or future expansion.
+## 💡 Usage Examples
+
+*   **"What was discussed in the marketing meeting?"** (Searches video transcripts and PDFs)
+*   **"Find the part where they showed the red car."** (Searches video visual frames for "red car")
+*   **"Find audio of applause."** (Searches audio acoustic embeddings)
+*   **"Summarize the Q3 report."** (Searches PDF text)
+
+## 🛠️ Troubleshooting
+
+*   **"MoviePy not installed"**: If video audio extraction fails, ensure `moviepy` is installed in the python environment (`pip install moviepy`).
+*   **API Rate Limits**: Indexing long videos generates many API calls (1 frame/10s). Ensure your API tiers support this load.
