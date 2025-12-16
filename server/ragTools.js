@@ -122,7 +122,7 @@ function searchTable(db, tableName, queryEmbedding, type, topK, dim) {
     // Check if table exists (quick check via select or try/catch)
     const vssResults = db.prepare(`
       SELECT 
-        d.id, d.file_name, d.content_type, d.chunk_text, v.distance
+        d.id, d.file_name, d.content_type, d.chunk_text, d.metadata, v.distance
       FROM ${vssTable} v
       JOIN documents d ON d.id = v.rowid
       WHERE vss_search(v.embedding, ?)
@@ -135,6 +135,7 @@ function searchTable(db, tableName, queryEmbedding, type, topK, dim) {
         file_name: r.file_name,
         content_type: r.content_type || type,
         chunk_text: r.chunk_text,
+        metadata: r.metadata,
         // Convert distance to similarity or just pass it
         // VSS returns L2 distance usually? Or Inner Product? Depends on config. 
         // Assuming relevance.
@@ -145,7 +146,7 @@ function searchTable(db, tableName, queryEmbedding, type, topK, dim) {
   }
 
   // Fallback Brute Force
-  const docs = db.prepare(`SELECT id, file_name, content_type, chunk_text, embedding FROM documents WHERE content_type = ?`).all(type);
+  const docs = db.prepare(`SELECT id, file_name, content_type, chunk_text, embedding, metadata FROM documents WHERE content_type = ?`).all(type);
   const sims = docs.map(doc => {
     const emb = deserializeEmbedding(doc.embedding);
     // Safety check dim
@@ -155,6 +156,7 @@ function searchTable(db, tableName, queryEmbedding, type, topK, dim) {
       file_name: doc.file_name,
       content_type: doc.content_type,
       chunk_text: doc.chunk_text,
+      metadata: doc.metadata,
       similarity: cosineSimilarity(queryEmbedding, emb)
     };
   }).filter(r => r !== null);
@@ -189,7 +191,10 @@ export async function searchPdfs(query, topK = 5) {
       allResults.push(...audioRes);
     }
 
-    return allResults.slice(0, topK * 2); // Return a mix
+    // Sort by relevance (if we had unified scoring, for now we mix)
+    // Actually we should probably just return them all and let LLM sort it out
+    // or limit the total size.
+    return allResults.slice(0, topK * 3); 
   } finally {
     db.close();
   }

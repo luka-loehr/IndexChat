@@ -134,28 +134,29 @@ def get_hf_audio_embedding(audio_path: Path):
         return None
     return response.json()
 
-def extract_key_frames(video_path: Path, num_frames=3):
-    """Extract key frames from video for visual indexing"""
+def extract_interval_frames(video_path: Path, interval_sec=10):
+    """Extract frames at regular intervals (every 10 seconds)"""
     frames = []
     try:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened(): return []
         
+        fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0: return []
+        duration = total_frames / fps
         
-        # Calculate timestamps to extract (start, middle, end)
-        indices = np.linspace(0, total_frames-1, num_frames, dtype=int)
+        # Calculate frame indices for every 'interval_sec' seconds
+        timestamps = np.arange(0, duration, interval_sec)
         
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        for ts in timestamps:
+            frame_idx = int(ts * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if ret:
-                # Convert to JPEG bytes
                 is_success, buffer = cv2.imencode(".jpg", frame)
                 if is_success:
                     frames.append({
-                        "timestamp": cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0,
+                        "timestamp": ts,
                         "data": buffer.tobytes()
                     })
         cap.release()
@@ -234,6 +235,7 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     except: pass
     conn.enable_load_extension(False)
     
+    # Updated schema with metadata column (JSON or text)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,7 +243,8 @@ def init_database(db_path: Path) -> sqlite3.Connection:
             content_type TEXT NOT NULL,
             chunk_text TEXT NOT NULL,
             embedding BLOB NOT NULL,
-            embedding_dimensions INTEGER NOT NULL
+            embedding_dimensions INTEGER NOT NULL,
+            metadata TEXT
         )
     """)
     
@@ -254,13 +257,13 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-def insert_document(conn, file_name, content_type, chunk_text, embedding, dims):
+def insert_document(conn, file_name, content_type, chunk_text, embedding, dims, metadata=None):
     if not embedding or not isinstance(embedding, list): return
     
     embedding_bytes = serialize_embedding(embedding)
     cursor = conn.execute(
-        "INSERT INTO documents (file_name, content_type, chunk_text, embedding, embedding_dimensions) VALUES (?, ?, ?, ?, ?)",
-        (file_name, content_type, chunk_text, embedding_bytes, dims)
+        "INSERT INTO documents (file_name, content_type, chunk_text, embedding, embedding_dimensions, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+        (file_name, content_type, chunk_text, embedding_bytes, dims, metadata)
     )
     doc_id = cursor.lastrowid
     
@@ -295,9 +298,10 @@ def build_index():
             if text.strip():
                 chunks = chunk_text(text)
                 print(f"  Indexing {len(chunks)} text chunks...")
-                for chunk in chunks:
+                for i, chunk in enumerate(chunks):
                     emb = get_openai_embedding(client, chunk)
-                    insert_document(conn, file_path.name, "text", chunk, emb, TEXT_EMBED_DIM)
+                    meta = f"chunk_index:{i}"
+                    insert_document(conn, file_path.name, "text", chunk, emb, TEXT_EMBED_DIM, meta)
                     total_chunks += 1
 
         # 2. Images
@@ -315,9 +319,10 @@ def build_index():
             transcript = transcribe_audio(client, file_path)
             if transcript.strip():
                 chunks = chunk_text(transcript)
-                for chunk in chunks:
+                for i, chunk in enumerate(chunks):
                     emb = get_openai_embedding(client, chunk)
-                    insert_document(conn, file_path.name, "text", f"[Transcript] {chunk}", emb, TEXT_EMBED_DIM)
+                    meta = f"chunk_index:{i}"
+                    insert_document(conn, file_path.name, "text", f"[Transcript] {chunk}", emb, TEXT_EMBED_DIM, meta)
                     total_chunks += 1
             
             # B. Audio Embedding (CLAP) - for "sound search"
@@ -333,13 +338,23 @@ def build_index():
             
             # C. Video Visual Frames (CLIP)
             if ext in VIDEO_EXTENSIONS:
-                print("  Extracting visual key frames...")
-                frames = extract_key_frames(file_path, num_frames=3)
+                print("  Extracting visual frames (every 10s)...")
+                # Every 10 seconds = 6 frames per minute
+                frames = extract_interval_frames(file_path, interval_sec=10)
+                
+                print(f"  Generated {len(frames)} frames. Indexing...")
                 for i, frame in enumerate(frames):
-                    print(f"    Embedding frame {i+1} at {frame['timestamp']:.1f}s...")
+                    ts = frame['timestamp']
+                    # Embed
                     emb = get_hf_image_embedding(image_data=frame['data'])
                     if emb:
-                        insert_document(conn, file_path.name, "image", f"Video Frame: {file_path.name} ({frame['timestamp']:.1f}s)", emb, IMAGE_EMBED_DIM)
+                        # Store metadata: "timestamp:10.5"
+                        meta = f"timestamp:{ts:.1f}"
+                        # Descriptive text for LLM
+                        chunk_text = f"Video Frame: {file_path.name} at {ts:.1f} seconds"
+                        
+                        insert_document(conn, file_path.name, "image", chunk_text, emb, IMAGE_EMBED_DIM, meta)
+                        print(f"    Indexed frame at {ts:.1f}s")
                         total_chunks += 1
 
     conn.commit()
