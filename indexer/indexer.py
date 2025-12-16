@@ -15,11 +15,18 @@ import mimetypes
 import requests
 import cv2
 import numpy as np
+import tempfile
 
 import tiktoken
 from openai import OpenAI
 from dotenv import load_dotenv
 from PIL import Image
+
+# Import moviepy for audio extraction
+try:
+    from moviepy import VideoFileClip
+except ImportError:
+    VideoFileClip = None
 
 # Optional imports for document handling
 try:
@@ -134,6 +141,26 @@ def get_hf_audio_embedding(audio_path: Path):
         return None
     return response.json()
 
+def extract_audio_from_video(video_path: Path):
+    """Extract audio from video to a temporary MP3 file"""
+    if not VideoFileClip:
+        print("MoviePy not installed. Cannot extract audio.")
+        return None
+        
+    try:
+        temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        temp_audio.close()
+        
+        video = VideoFileClip(str(video_path))
+        if video.audio:
+            video.audio.write_audiofile(temp_audio.name, verbose=False, logger=None)
+            video.close()
+            return Path(temp_audio.name)
+        video.close()
+    except Exception as e:
+        print(f"Audio extraction error: {e}")
+    return None
+
 def extract_interval_frames(video_path: Path, interval_sec=10):
     """Extract frames at regular intervals (every 10 seconds)"""
     frames = []
@@ -143,22 +170,26 @@ def extract_interval_frames(video_path: Path, interval_sec=10):
         
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps
-        
-        # Calculate frame indices for every 'interval_sec' seconds
-        timestamps = np.arange(0, duration, interval_sec)
-        
-        for ts in timestamps:
-            frame_idx = int(ts * fps)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if ret:
-                is_success, buffer = cv2.imencode(".jpg", frame)
-                if is_success:
-                    frames.append({
-                        "timestamp": ts,
-                        "data": buffer.tobytes()
-                    })
+        if fps > 0:
+            duration = total_frames / fps
+        else:
+            duration = 0
+            
+        if duration > 0:
+            # Calculate frame indices for every 'interval_sec' seconds
+            timestamps = np.arange(0, duration, interval_sec)
+            
+            for ts in timestamps:
+                frame_idx = int(ts * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if ret:
+                    is_success, buffer = cv2.imencode(".jpg", frame)
+                    if is_success:
+                        frames.append({
+                            "timestamp": ts,
+                            "data": buffer.tobytes()
+                        })
         cap.release()
     except Exception as e:
         print(f"Frame extraction error: {e}")
@@ -235,7 +266,6 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     except: pass
     conn.enable_load_extension(False)
     
-    # Updated schema with metadata column (JSON or text)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -314,32 +344,51 @@ def build_index():
         
         # 3. Audio / Video
         elif ext in AUDIO_EXTENSIONS or ext in VIDEO_EXTENSIONS:
-            # A. Transcribe (Text)
-            print("  Transcribing...")
-            transcript = transcribe_audio(client, file_path)
-            if transcript.strip():
-                chunks = chunk_text(transcript)
-                for i, chunk in enumerate(chunks):
-                    emb = get_openai_embedding(client, chunk)
-                    meta = f"chunk_index:{i}"
-                    insert_document(conn, file_path.name, "text", f"[Transcript] {chunk}", emb, TEXT_EMBED_DIM, meta)
-                    total_chunks += 1
+            # Determine audio source path (original file or extracted temp file)
+            audio_source_path = file_path
+            temp_audio_path = None
             
-            # B. Audio Embedding (CLAP) - for "sound search"
-            if ext in AUDIO_EXTENSIONS:
-                print("  Generating cloud Audio embedding...")
-                emb = get_hf_audio_embedding(file_path)
+            # If Video, extract audio first for CLAP/Whisper
+            if ext in VIDEO_EXTENSIONS:
+                print("  Extracting audio track from video...")
+                temp_audio_path = extract_audio_from_video(file_path)
+                if temp_audio_path:
+                    audio_source_path = temp_audio_path
+                else:
+                    print("  ⚠️ Could not extract audio from video. Skipping audio analysis.")
+                    audio_source_path = None
+
+            if audio_source_path:
+                # A. Transcribe (Text)
+                print("  Transcribing...")
+                transcript = transcribe_audio(client, audio_source_path)
+                if transcript.strip():
+                    chunks = chunk_text(transcript)
+                    for i, chunk in enumerate(chunks):
+                        emb = get_openai_embedding(client, chunk)
+                        meta = f"chunk_index:{i}"
+                        insert_document(conn, file_path.name, "text", f"[Transcript] {chunk}", emb, TEXT_EMBED_DIM, meta)
+                        total_chunks += 1
+                
+                # B. Audio Embedding (CLAP) - for "sound search"
+                print("  Generating cloud Audio embedding (CLAP)...")
+                emb = get_hf_audio_embedding(audio_source_path)
                 if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
                     emb = emb[0]
                 
                 if emb and isinstance(emb, list):
                     insert_document(conn, file_path.name, "audio", f"Audio File: {file_path.name}", emb, AUDIO_EMBED_DIM)
                     total_chunks += 1
+                
+                # Cleanup temp file if created
+                if temp_audio_path and temp_audio_path.exists():
+                    try:
+                        os.unlink(temp_audio_path)
+                    except: pass
             
-            # C. Video Visual Frames (CLIP)
+            # C. Video Visual Frames (CLIP) - Only for video
             if ext in VIDEO_EXTENSIONS:
                 print("  Extracting visual frames (every 10s)...")
-                # Every 10 seconds = 6 frames per minute
                 frames = extract_interval_frames(file_path, interval_sec=10)
                 
                 print(f"  Generated {len(frames)} frames. Indexing...")
